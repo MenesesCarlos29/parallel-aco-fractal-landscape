@@ -1,25 +1,26 @@
-#include <vector>
-#include <iostream>
+#include <algorithm>
 #include <chrono>
-#include <fstream>
 #include <cmath>
-#include <numeric>
-#include <cstring>
-#include <iomanip>
-#include <filesystem>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <limits>
+#include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
-#include <memory>
-#include <cstdlib>
+#include <vector>
 
-#include "fractal_land.hpp"
 #include "ant.hpp"
+#include "fractal_land.hpp"
 #include "pheronome.hpp"
+#include "rand_generator.hpp"
 #include "renderer.hpp"
 #include "window.hpp"
-#include "rand_generator.hpp"
 
 struct Config {
     std::size_t grid_size = 513;
@@ -27,7 +28,7 @@ struct Config {
     double alpha = 0.7;
     double beta = 0.999;
     double eps = 0.8;
-    std::size_t max_iters = 3000;
+    std::size_t max_iters = 2000;
     int repetitions = 5;
     std::size_t seed = 2026;
     bool gui = true;
@@ -37,6 +38,18 @@ struct ParametresFractal {
     fractal_land::dim_t log2_sous_grille = 9;
     unsigned long nb_graines = 1;
     std::size_t taille_effective = 513;
+};
+
+struct MesuresRepetition {
+    double t_move_ants_ms = 0.0;
+    double t_evap_ms = 0.0;
+    double t_pher_update_ms = 0.0;
+    double t_render_ms = 0.0;
+    double t_total_ms = 0.0;
+    std::size_t premiere_iteration_nourriture = 0;
+    std::size_t food_kpi = 0;
+    std::size_t iterations_executees = 0;
+    std::uint64_t checksum = 0;
 };
 
 void afficher_aide(const char* programme) {
@@ -139,10 +152,6 @@ Config parse_args(int argc, char* argv[]) {
         throw std::invalid_argument("--eps doit etre dans [0,1].");
     }
 
-    if (cfg.gui) {
-        cfg.repetitions = 1;
-    }
-
     return cfg;
 }
 
@@ -172,17 +181,6 @@ void normaliser_terrain(fractal_land& land) {
             land(i, j) = (land(i, j) - min_val) / delta;
         }
     }
-}
-
-void advance_time(const fractal_land& land, pheronome& phen,
-                  const position_t& pos_nest, const position_t& pos_food,
-                  std::vector<ant>& ants, std::size_t& cpteur)
-{
-    for (std::size_t i = 0; i < ants.size(); ++i) {
-        ants[i].advance(phen, land, pos_food, pos_nest, cpteur);
-    }
-    phen.do_evaporation();
-    phen.update();
 }
 
 std::uint64_t bits_double(double valeur) {
@@ -225,7 +223,144 @@ double calculer_moyenne(const std::vector<double>& valeurs) {
 double calculer_ecart_type(const std::vector<double>& valeurs, double moyenne) {
     const double somme_carres =
         std::inner_product(valeurs.begin(), valeurs.end(), valeurs.begin(), 0.0);
-    return std::sqrt(somme_carres / static_cast<double>(valeurs.size()) - moyenne * moyenne);
+    double variance = somme_carres / static_cast<double>(valeurs.size()) - moyenne * moyenne;
+    if (variance < 0.0 && variance > -1e-12) {
+        variance = 0.0;
+    }
+    return std::sqrt(std::max(0.0, variance));
+}
+
+MesuresRepetition executer_repetition(const Config& cfg,
+                                      const ParametresFractal& params_fractal,
+                                      bool activer_gui)
+{
+    using horloge = std::chrono::high_resolution_clock;
+
+    std::size_t current_seed = cfg.seed;
+
+    fractal_land land(
+        params_fractal.log2_sous_grille,
+        params_fractal.nb_graines,
+        1.0,
+        static_cast<int>(current_seed & 0x7fffffffU)
+    );
+    normaliser_terrain(land);
+
+    const int borne_min = 1;
+    const int borne_max = static_cast<int>(land.dimensions()) - 2;
+    position_t pos_nest{static_cast<int>(land.dimensions() / 2), static_cast<int>(land.dimensions() / 2)};
+    position_t pos_food{
+        std::max(borne_min, static_cast<int>((3 * land.dimensions()) / 4)),
+        std::max(borne_min, static_cast<int>((3 * land.dimensions()) / 4))
+    };
+    pos_food.x = std::min(pos_food.x, borne_max);
+    pos_food.y = std::min(pos_food.y, borne_max);
+    if (pos_food == pos_nest) {
+        pos_food.x = std::min(pos_food.x + 1, borne_max);
+    }
+
+    ant::set_exploration_coef(cfg.eps);
+
+    std::vector<ant> ants;
+    ants.reserve(cfg.nb_ants);
+    auto gen_ant_pos = [&land, &current_seed]() {
+        return rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), current_seed);
+    };
+    for (std::size_t i = 0; i < cfg.nb_ants; ++i) {
+        ants.emplace_back(position_t{gen_ant_pos(), gen_ant_pos()}, current_seed);
+    }
+
+    pheronome phen(land.dimensions(), pos_food, pos_nest, cfg.alpha, cfg.beta);
+
+    std::unique_ptr<Window> win;
+    std::unique_ptr<Renderer> renderer;
+    if (activer_gui) {
+        win = std::make_unique<Window>(
+            "Simulation ACO",
+            static_cast<int>(2 * land.dimensions() + 10),
+            static_cast<int>(land.dimensions() + 266)
+        );
+        renderer = std::make_unique<Renderer>(land, phen, pos_nest, pos_food, ants);
+    }
+
+    MesuresRepetition mesures;
+    std::size_t food_quantity = 0;
+    std::size_t it = 0;
+    bool cont_loop = true;
+    bool premiere_nourriture_detectee = false;
+
+    const auto debut_total = horloge::now();
+    while (cont_loop && it < cfg.max_iters) {
+        ++it;
+
+        if (activer_gui) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_QUIT) {
+                    cont_loop = false;
+                }
+            }
+        }
+
+        const auto debut_move = horloge::now();
+        for (std::size_t i = 0; i < ants.size(); ++i) {
+            ants[i].advance(phen, land, pos_food, pos_nest, food_quantity);
+        }
+        const auto fin_move = horloge::now();
+        mesures.t_move_ants_ms += std::chrono::duration<double, std::milli>(fin_move - debut_move).count();
+
+        const auto debut_evap = horloge::now();
+        phen.do_evaporation();
+        const auto fin_evap = horloge::now();
+        mesures.t_evap_ms += std::chrono::duration<double, std::milli>(fin_evap - debut_evap).count();
+
+        const auto debut_update = horloge::now();
+        phen.update();
+        const auto fin_update = horloge::now();
+        mesures.t_pher_update_ms +=
+            std::chrono::duration<double, std::milli>(fin_update - debut_update).count();
+
+        if (activer_gui) {
+            const auto debut_render = horloge::now();
+            renderer->display(*win, food_quantity);
+            win->blit();
+            const auto fin_render = horloge::now();
+            mesures.t_render_ms +=
+                std::chrono::duration<double, std::milli>(fin_render - debut_render).count();
+        }
+
+        if (!premiere_nourriture_detectee && food_quantity > 0) {
+            mesures.premiere_iteration_nourriture = it;
+            premiere_nourriture_detectee = true;
+        }
+    }
+    const auto fin_total = horloge::now();
+
+    mesures.t_total_ms = std::chrono::duration<double, std::milli>(fin_total - debut_total).count();
+    mesures.food_kpi = food_quantity;
+    mesures.iterations_executees = it;
+    mesures.checksum = calculer_checksum(phen, ants);
+
+    return mesures;
+}
+
+void afficher_sanity_check(const MesuresRepetition& mesures, bool mode_gui) {
+    const double somme_etapes =
+        mesures.t_move_ants_ms + mesures.t_evap_ms + mesures.t_pher_update_ms + mesures.t_render_ms;
+    const double ecart = std::abs(mesures.t_total_ms - somme_etapes);
+    const double tolerance = std::max(1.0, 0.05 * mesures.t_total_ms);
+    const bool check_total = ecart <= tolerance;
+
+    std::cout << "Sanity Check: T_total ~= T_move_ants + T_evap + T_pher_update + T_render"
+              << " | ecart=" << std::fixed << std::setprecision(6) << ecart << " ms"
+              << " | statut=" << (check_total ? "OK" : "A_VERIFIER") << "\n";
+
+    if (!mode_gui) {
+        const bool check_render = std::abs(mesures.t_render_ms) <= 1e-9;
+        std::cout << "Sanity Check (--gui 0): T_render ~ 0"
+                  << " | valeur=" << std::fixed << std::setprecision(6) << mesures.t_render_ms << " ms"
+                  << " | statut=" << (check_render ? "OK" : "A_VERIFIER") << "\n";
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -238,156 +373,130 @@ int main(int argc, char* argv[]) {
                       << " est ajustee a " << params_fractal.taille_effective << ".\n";
         }
 
+        std::cout << "--- Q1 Instrumentation monocoeur (timings par etape) ---\n";
+        std::cout << "Grille: " << params_fractal.taille_effective
+                  << " | Fourmis: " << cfg.nb_ants
+                  << " | Iterations max: " << cfg.max_iters
+                  << " | Repetitions: " << cfg.repetitions
+                  << " | GUI: " << (cfg.gui ? "ON" : "OFF") << "\n";
+
+        std::cout << "Exécution du Warm-up pour chauffer le cache...\n";
+        (void)executer_repetition(cfg, params_fractal, false);
+
+        bool sdl_initialisee = false;
         if (cfg.gui) {
-            SDL_Init(SDL_INIT_VIDEO);
+            if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+                throw std::runtime_error("Impossible d'initialiser SDL en mode GUI.");
+            }
+            sdl_initialisee = true;
         }
 
-        std::cout << "--- Baseline ACO monocoeur (Q0) ---\n";
-        std::cout << "Grille : " << params_fractal.taille_effective
-                  << " | Fourmis : " << cfg.nb_ants
-                  << " | Iterations : " << cfg.max_iters
-                  << " | Repetitions : " << cfg.repetitions
-                  << " | GUI : " << (cfg.gui ? "ON" : "OFF") << "\n";
-
-        std::vector<double> temps_ms;
-        std::vector<std::size_t> food_kpis;
+        std::vector<double> t_move_ants;
+        std::vector<double> t_evap;
+        std::vector<double> t_pher_update;
+        std::vector<double> t_render;
+        std::vector<double> t_total;
+        std::vector<std::size_t> premiere_iteration_nourriture;
+        std::vector<std::size_t> food_kpi;
         std::vector<std::uint64_t> checksums;
-        std::vector<std::size_t> premier_it;
 
-        temps_ms.reserve(static_cast<std::size_t>(cfg.repetitions));
-        food_kpis.reserve(static_cast<std::size_t>(cfg.repetitions));
+        t_move_ants.reserve(static_cast<std::size_t>(cfg.repetitions));
+        t_evap.reserve(static_cast<std::size_t>(cfg.repetitions));
+        t_pher_update.reserve(static_cast<std::size_t>(cfg.repetitions));
+        t_render.reserve(static_cast<std::size_t>(cfg.repetitions));
+        t_total.reserve(static_cast<std::size_t>(cfg.repetitions));
+        premiere_iteration_nourriture.reserve(static_cast<std::size_t>(cfg.repetitions));
+        food_kpi.reserve(static_cast<std::size_t>(cfg.repetitions));
         checksums.reserve(static_cast<std::size_t>(cfg.repetitions));
-        premier_it.reserve(static_cast<std::size_t>(cfg.repetitions));
 
         for (int rep = 0; rep < cfg.repetitions; ++rep) {
-            std::size_t current_seed = cfg.seed;
+            const MesuresRepetition mesures = executer_repetition(cfg, params_fractal, cfg.gui);
 
-            fractal_land land(
-                params_fractal.log2_sous_grille,
-                params_fractal.nb_graines,
-                1.0,
-                static_cast<int>(current_seed & 0x7fffffffU)
-            );
-            normaliser_terrain(land);
+            t_move_ants.push_back(mesures.t_move_ants_ms);
+            t_evap.push_back(mesures.t_evap_ms);
+            t_pher_update.push_back(mesures.t_pher_update_ms);
+            t_render.push_back(mesures.t_render_ms);
+            t_total.push_back(mesures.t_total_ms);
+            premiere_iteration_nourriture.push_back(mesures.premiere_iteration_nourriture);
+            food_kpi.push_back(mesures.food_kpi);
+            checksums.push_back(mesures.checksum);
 
-            const int borne_min = 1;
-            const int borne_max = static_cast<int>(land.dimensions()) - 2;
-            position_t pos_nest{static_cast<int>(land.dimensions() / 2), static_cast<int>(land.dimensions() / 2)};
-            position_t pos_food{
-                std::max(borne_min, static_cast<int>((3 * land.dimensions()) / 4)),
-                std::max(borne_min, static_cast<int>((3 * land.dimensions()) / 4))
-            };
-            pos_food.x = std::min(pos_food.x, borne_max);
-            pos_food.y = std::min(pos_food.y, borne_max);
-            if (pos_food == pos_nest) {
-                pos_food.x = std::min(pos_food.x + 1, borne_max);
-            }
+            std::cout << "Rep " << (rep + 1) << "/" << cfg.repetitions
+                      << " | T_move_ants=" << std::fixed << std::setprecision(6) << mesures.t_move_ants_ms << " ms"
+                      << " | T_evap=" << mesures.t_evap_ms << " ms"
+                      << " | T_pher_update=" << mesures.t_pher_update_ms << " ms"
+                      << " | T_render=" << mesures.t_render_ms << " ms"
+                      << " | T_total=" << mesures.t_total_ms << " ms"
+                      << " | First_Iteration=" << mesures.premiere_iteration_nourriture
+                      << " | Food_KPI=" << mesures.food_kpi
+                      << " | Checksum=" << mesures.checksum
+                      << "\n";
 
-            ant::set_exploration_coef(cfg.eps);
-
-            std::vector<ant> ants;
-            ants.reserve(cfg.nb_ants);
-            auto gen_ant_pos = [&land, &current_seed]() {
-                return rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), current_seed);
-            };
-            for (std::size_t i = 0; i < cfg.nb_ants; ++i) {
-                ants.emplace_back(position_t{gen_ant_pos(), gen_ant_pos()}, current_seed);
-            }
-
-            pheronome phen(land.dimensions(), pos_food, pos_nest, cfg.alpha, cfg.beta);
-
-            std::unique_ptr<Window> win;
-            std::unique_ptr<Renderer> renderer;
-            if (cfg.gui) {
-                win = std::make_unique<Window>(
-                    "Ant Simulation",
-                    static_cast<int>(2 * land.dimensions() + 10),
-                    static_cast<int>(land.dimensions() + 266)
-                );
-                renderer = std::make_unique<Renderer>(land, phen, pos_nest, pos_food, ants);
-            }
-
-            std::size_t food_quantity = 0;
-            bool cont_loop = true;
-            bool premier_retour_nourriture = true;
-            std::size_t it = 0;
-
-            const auto debut = std::chrono::high_resolution_clock::now();
-            while (cont_loop && it < cfg.max_iters) {
-                ++it;
-
-                if (cfg.gui) {
-                    SDL_Event event;
-                    while (SDL_PollEvent(&event)) {
-                        if (event.type == SDL_QUIT) {
-                            cont_loop = false;
-                        }
-                    }
-                }
-
-                advance_time(land, phen, pos_nest, pos_food, ants, food_quantity);
-
-                if (cfg.gui) {
-                    renderer->display(*win, food_quantity);
-                    win->blit();
-                }
-
-                if (premier_retour_nourriture && food_quantity > 0) {
-                    if (cfg.gui) {
-                        std::cout << "Premiere nourriture au nid a l'iteration " << it << "\n";
-                    }
-                    premier_it.push_back(it);
-                    premier_retour_nourriture = false;
-                }
-            }
-            const auto fin = std::chrono::high_resolution_clock::now();
-
-            const std::chrono::duration<double, std::milli> duree = fin - debut;
-            const std::uint64_t checksum = calculer_checksum(phen, ants);
-
-            temps_ms.push_back(duree.count());
-            food_kpis.push_back(food_quantity);
-            checksums.push_back(checksum);
-
-            if (!cfg.gui) {
-                std::cout << "Rep " << (rep + 1) << "/" << cfg.repetitions
-                          << " | Temps(ms): " << duree.count()
-                          << " | First_Iteration " << premier_it.back()
-                          << " | Food_KPI: " << food_quantity
-                          << " | Checksum: " << checksum << "\n";
-            }
+            afficher_sanity_check(mesures, cfg.gui);
         }
 
-        if (cfg.gui) {
+        if (sdl_initialisee) {
             SDL_Quit();
-            return 0;
         }
 
         std::filesystem::create_directories("results");
-        std::ofstream csv_file("results/Q0_baseline.csv");
+        std::ofstream csv_file("results/Q1_timings_breakdown.csv");
         if (!csv_file.is_open()) {
-            std::cerr << "Erreur: impossible d'ecrire results/Q0_baseline.csv\n";
+            std::cerr << "Erreur: impossible d'ecrire results/Q1_timings_breakdown.csv\n";
             return 1;
         }
 
-        const double moyenne = calculer_moyenne(temps_ms);
-        const double ecart_type = calculer_ecart_type(temps_ms, moyenne);
-
-        csv_file << "Repetition,Time_ms,First_Iteration,Food_KPI,Checksum\n";
-        for (std::size_t i = 0; i < temps_ms.size(); ++i) {
+        csv_file << "Repetition,Time_ms,First_Iteration,Food_KPI,Checksum,T_move_ants,T_evap,T_pher_update,T_render,T_total\n";
+        for (std::size_t i = 0; i < t_total.size(); ++i) {
             csv_file << (i + 1) << ","
-                     << std::fixed << std::setprecision(6) << temps_ms[i] << ","
-                     << premier_it[i] << ","
-                     << food_kpis[i] << ","
-                     << checksums[i] << "\n";
+                     << std::fixed << std::setprecision(6) << t_total[i] << ","
+                     << premiere_iteration_nourriture[i] << ","
+                     << food_kpi[i] << ","
+                     << checksums[i] << ","
+                     << t_move_ants[i] << ","
+                     << t_evap[i] << ","
+                     << t_pher_update[i] << ","
+                     << t_render[i] << ","
+                     << t_total[i] << "\n";
         }
-        csv_file << "MEAN_TIME_MS," << std::fixed << std::setprecision(6) << moyenne << ",,\n";
-        csv_file << "STD_DEV_TIME_MS," << std::fixed << std::setprecision(6) << ecart_type << ",,\n";
 
-        std::cout << "\n=== Resultats Q0 (Baseline) ===\n";
-        std::cout << "Temps moyen (ms): " << moyenne << "\n";
-        std::cout << "Ecart-type (ms): " << ecart_type << "\n";
-        std::cout << "CSV genere: results/Q0_baseline.csv\n";
+        const double mean_move = calculer_moyenne(t_move_ants);
+        const double mean_evap = calculer_moyenne(t_evap);
+        const double mean_update = calculer_moyenne(t_pher_update);
+        const double mean_render = calculer_moyenne(t_render);
+        const double mean_total = calculer_moyenne(t_total);
+
+        const double std_move = calculer_ecart_type(t_move_ants, mean_move);
+        const double std_evap = calculer_ecart_type(t_evap, mean_evap);
+        const double std_update = calculer_ecart_type(t_pher_update, mean_update);
+        const double std_render = calculer_ecart_type(t_render, mean_render);
+        const double std_total = calculer_ecart_type(t_total, mean_total);
+
+        csv_file << "MEAN,"
+                 << std::fixed << std::setprecision(6) << mean_total << ","
+                 << ",,,"
+                 << mean_move << ","
+                 << mean_evap << ","
+                 << mean_update << ","
+                 << mean_render << ","
+                 << mean_total << "\n";
+        csv_file << "STD_DEV,"
+                 << std::fixed << std::setprecision(6) << std_total << ","
+                 << ",,,"
+                 << std_move << ","
+                 << std_evap << ","
+                 << std_update << ","
+                 << std_render << ","
+                 << std_total << "\n";
+
+        std::cout << "\n=== Resultats Q1 (timings par etape) ===\n";
+        std::cout << "Moyennes (ms):"
+                  << " move_ants=" << mean_move
+                  << " | evap=" << mean_evap
+                  << " | pher_update=" << mean_update
+                  << " | render=" << mean_render
+                  << " | total=" << mean_total << "\n";
+        std::cout << "CSV genere: results/Q1_timings_breakdown.csv\n";
 
         return 0;
     } catch (const std::exception& e) {

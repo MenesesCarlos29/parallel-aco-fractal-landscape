@@ -1,3 +1,5 @@
 
-docs/*
-!docs/*.pdf
+report/*
+!report/*.pdf
+!report/*.tex
+!report/imgs

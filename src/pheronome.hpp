@@ -62,6 +62,8 @@ public:
       return m_map_of_pheronome[index(pos)];
     }
 
+    size_t dimensions() const { return m_dim; }
+
     void do_evaporation( ) {
         for ( std::size_t i = 1; i <= m_dim; ++i )
             for ( std::size_t j = 1; j <= m_dim; ++j ) {

@@ -4,7 +4,7 @@
 
 Renderer::Renderer( const fractal_land& land, const pheronome& phen, 
                     const position_t& pos_nest, const position_t& pos_food,
-                    const std::vector<ant>& ants )
+                    const AntSwarm& ants )
     :   m_ref_land( land ),
         m_land( nullptr ),
         m_ref_phen( phen ),
@@ -64,10 +64,9 @@ void Renderer::display( Window& win, std::size_t const& compteur )
     SDL_SetRenderDrawBlendMode( renderer, SDL_BLENDMODE_BLEND );
     
     // Affichage des fourmis dans le cadran en haut à gauche :
-    for ( auto& ant : m_ref_ants ) {
-        const position_t& pos_ant = ant.get_position( );
+    for ( std::size_t i = 0; i < m_ref_ants.size(); ++i ) {
         win.set_pen( 0, 255, 255 );
-        win.pset( static_cast<int>( pos_ant.x ), static_cast<int>( pos_ant.y ) );
+        win.pset( m_ref_ants.x_at(i), m_ref_ants.y_at(i) );
     }
     
     // Affichage des phéronomes dans le cadran en haut à droite :

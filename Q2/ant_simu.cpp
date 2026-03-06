@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,7 +26,7 @@
 struct Config {
     std::size_t grid_size = 513;
     std::size_t nb_ants = 5000;
-    double alpha = 0.5;
+    double alpha = 0.7;
     double beta = 0.999;
     double eps = 0.8;
     std::size_t max_iters = 2000;
@@ -195,7 +196,7 @@ void melanger_checksum(std::uint64_t& checksum, std::uint64_t valeur) {
     checksum ^= valeur + 0x9e3779b97f4a7c15ULL + (checksum << 6U) + (checksum >> 2U);
 }
 
-std::uint64_t calculer_checksum(const pheronome& phen, const std::vector<ant>& ants) {
+std::uint64_t calculer_checksum(const pheronome& phen, const AntSwarm& ants) {
     std::uint64_t checksum = 1469598103934665603ULL;
     const std::size_t dim = phen.dimensions();
 
@@ -207,14 +208,139 @@ std::uint64_t calculer_checksum(const pheronome& phen, const std::vector<ant>& a
         }
     }
 
-    for (const auto& a : ants) {
-        const auto& pos = a.get_position();
-        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(pos.x)));
-        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(pos.y)));
-        melanger_checksum(checksum, a.is_loaded() ? 0xA5A5A5A5ULL : 0x5A5A5A5AULL);
+    for (std::size_t i = 0; i < ants.size(); ++i) {
+        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(ants.x_at(i))));
+        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(ants.y_at(i))));
+        melanger_checksum(checksum, ants.is_loaded_at(i) ? 0xA5A5A5A5ULL : 0x5A5A5A5AULL);
     }
 
     return checksum;
+}
+
+struct ReferenceBaseline {
+    bool disponible = false;
+    std::string message;
+    std::vector<std::size_t> food_kpi;
+    std::vector<std::uint64_t> checksums;
+};
+
+ReferenceBaseline charger_reference_baseline(const std::filesystem::path& chemin_csv) {
+    ReferenceBaseline reference;
+
+    if (!std::filesystem::exists(chemin_csv)) {
+        reference.message = "fichier de reference absent";
+        return reference;
+    }
+
+    std::ifstream fichier(chemin_csv);
+    if (!fichier.is_open()) {
+        reference.message = "impossible d'ouvrir le fichier de reference";
+        return reference;
+    }
+
+    std::string ligne;
+    if (!std::getline(fichier, ligne)) {
+        reference.message = "fichier de reference vide";
+        return reference;
+    }
+
+    while (std::getline(fichier, ligne)) {
+        if (ligne.empty()) {
+            continue;
+        }
+
+        std::stringstream flux(ligne);
+        std::string col_rep;
+        std::string col_first_it;
+        std::string col_food_kpi;
+        std::string col_checksum;
+
+        if (!std::getline(flux, col_rep, ',')) {
+            continue;
+        }
+        if (col_rep == "MEAN" || col_rep == "STD_DEV") {
+            break;
+        }
+        if (!std::getline(flux, col_first_it, ',')) {
+            continue;
+        }
+        if (!std::getline(flux, col_food_kpi, ',')) {
+            continue;
+        }
+        if (!std::getline(flux, col_checksum, ',')) {
+            continue;
+        }
+
+        try {
+            (void)std::stoull(col_rep);
+            reference.food_kpi.push_back(static_cast<std::size_t>(std::stoull(col_food_kpi)));
+            reference.checksums.push_back(static_cast<std::uint64_t>(std::stoull(col_checksum)));
+        } catch (...) {
+            continue;
+        }
+    }
+
+    if (reference.food_kpi.empty() || reference.checksums.empty()) {
+        reference.message = "aucune repetition exploitable dans la reference";
+        return reference;
+    }
+
+    reference.disponible = true;
+    reference.message = "reference chargee";
+    return reference;
+}
+
+void afficher_verification_contrat_baseline(const std::vector<std::size_t>& food_kpi_q2,
+                                            const std::vector<std::uint64_t>& checksums_q2) {
+    const auto reference = charger_reference_baseline("../results/Q1_timings_breakdown.csv");
+
+    if (!reference.disponible) {
+        std::cout << "Verification contrat baseline/Q2 (Food_KPI + Checksum): A_VERIFIER"
+                  << " | raison=" << reference.message << "\n";
+        return;
+    }
+
+    const std::size_t nb_compare = std::min(
+        food_kpi_q2.size(),
+        std::min(reference.food_kpi.size(), reference.checksums.size())
+    );
+
+    if (nb_compare == 0) {
+        std::cout << "Verification contrat baseline/Q2 (Food_KPI + Checksum): A_VERIFIER"
+                  << " | raison=aucune repetition commune\n";
+        return;
+    }
+
+    bool verification_ok = true;
+    for (std::size_t i = 0; i < nb_compare; ++i) {
+        if (food_kpi_q2[i] != reference.food_kpi[i] || checksums_q2[i] != reference.checksums[i]) {
+            verification_ok = false;
+            break;
+        }
+    }
+
+    std::string statut = "A_VERIFIER";
+    if (verification_ok && nb_compare == food_kpi_q2.size()) {
+        statut = "OK";
+    } else if (verification_ok) {
+        statut = "OK_PARTIEL";
+    }
+
+    std::cout << "Verification contrat baseline/Q2 (Food_KPI + Checksum): "
+              << statut
+              << " | repetitions_comparees=" << nb_compare << "/" << food_kpi_q2.size() << "\n";
+
+    if (!verification_ok) {
+        for (std::size_t i = 0; i < nb_compare; ++i) {
+            if (food_kpi_q2[i] != reference.food_kpi[i] || checksums_q2[i] != reference.checksums[i]) {
+                std::cout << "  Rep " << (i + 1)
+                          << " | Q2(Food_KPI=" << food_kpi_q2[i]
+                          << ", Checksum=" << checksums_q2[i]
+                          << ") vs Reference(Food_KPI=" << reference.food_kpi[i]
+                          << ", Checksum=" << reference.checksums[i] << ")\n";
+            }
+        }
+    }
 }
 
 double calculer_moyenne(const std::vector<double>& valeurs) {
@@ -261,16 +387,9 @@ MesuresRepetition executer_repetition(const Config& cfg,
         pos_food.x = std::min(pos_food.x + 1, borne_max);
     }
 
-    ant::set_exploration_coef(cfg.eps);
-
-    std::vector<ant> ants;
-    ants.reserve(cfg.nb_ants);
-    auto gen_ant_pos = [&land, &current_seed]() {
-        return rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), current_seed);
-    };
-    for (std::size_t i = 0; i < cfg.nb_ants; ++i) {
-        ants.emplace_back(position_t{gen_ant_pos(), gen_ant_pos()}, current_seed);
-    }
+    AntSwarm::set_exploration_coef(cfg.eps);
+    AntSwarm ants(cfg.nb_ants);
+    ants.initialiser_positions_aleatoires(land, current_seed);
 
     pheronome phen(land.dimensions(), pos_food, pos_nest, cfg.alpha, cfg.beta);
 
@@ -306,7 +425,7 @@ MesuresRepetition executer_repetition(const Config& cfg,
 
         const auto debut_move = horloge::now();
         for (std::size_t i = 0; i < ants.size(); ++i) {
-            ants[i].advance(phen, land, pos_food, pos_nest, food_quantity);
+            ants.advance_one(i, phen, land, pos_food, pos_nest, food_quantity);
         }
         const auto fin_move = horloge::now();
         mesures.t_move_ants_ms += std::chrono::duration<double, std::milli>(fin_move - debut_move).count();
@@ -375,7 +494,7 @@ int main(int argc, char* argv[]) {
                       << " est ajustee a " << params_fractal.taille_effective << ".\n";
         }
 
-        std::cout << "--- Q1 Instrumentation monocoeur (timings par etape) ---\n";
+        std::cout << "--- Q2 Instrumentation monocoeur (timings par etape, SoA) ---\n";
         std::cout << "Grille: " << params_fractal.taille_effective
                   << " | Fourmis: " << cfg.nb_ants
                   << " | Iterations max: " << cfg.max_iters
@@ -442,9 +561,9 @@ int main(int argc, char* argv[]) {
         }
 
         std::filesystem::create_directories("results");
-        std::ofstream csv_file("results/Q1_timings_breakdown.csv");
+        std::ofstream csv_file("results/Q2_timings_breakdown.csv");
         if (!csv_file.is_open()) {
-            std::cerr << "Erreur: impossible d'ecrire results/Q1_timings_breakdown.csv\n";
+            std::cerr << "Erreur: impossible d'ecrire results/Q2_timings_breakdown.csv\n";
             return 1;
         }
 
@@ -488,14 +607,15 @@ int main(int argc, char* argv[]) {
                  << std_render << ","
                  << std_total << "\n";
 
-        std::cout << "\n=== Resultats Q1 (timings par etape) ===\n";
+        std::cout << "\n=== Resultats Q2 (timings par etape) ===\n";
         std::cout << "Moyennes (ms):"
                   << " move_ants=" << mean_move
                   << " | evap=" << mean_evap
                   << " | pher_update=" << mean_update
                   << " | render=" << mean_render
                   << " | total=" << mean_total << "\n";
-        std::cout << "CSV genere: results/Q1_timings_breakdown.csv\n";
+        std::cout << "CSV local genere: results/Q2_timings_breakdown.csv\n";
+        afficher_verification_contrat_baseline(food_kpi, checksums);
 
         return 0;
     } catch (const std::exception& e) {

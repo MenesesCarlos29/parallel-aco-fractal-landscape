@@ -24,12 +24,11 @@ $(CIBLE): $(OBJETS)
 
 run: all
 	@mkdir -p results ../results
-	@echo "Lancement du benchmark Q2 (--gui 0 --iter 3000 --rep 5)..."
 	@./$(CIBLE) --gui 0 --iter 3000 --rep 5
-	@if [ -f results/Q1_timings_breakdown.csv ]; then \
-		cp results/Q1_timings_breakdown.csv ../results/Q2_timings_breakdown.csv; \
+	@if [ -f results/Q2_timings_breakdown.csv ]; then \
+		cp results/Q2_timings_breakdown.csv ../results/Q2_timings_breakdown.csv; \
 	else \
-		echo "Erreur: fichier results/Q1_timings_breakdown.csv introuvable."; \
+		echo "Erreur: fichier results/Q2_timings_breakdown.csv introuvable."; \
 		exit 1; \
 	fi
 	@echo "Resultats enregistres dans ../results/Q2_timings_breakdown.csv"

@@ -25,7 +25,7 @@
 struct Config {
     std::size_t grid_size = 513;
     std::size_t nb_ants = 5000;
-    double alpha = 0.5;
+    double alpha = 0.7;
     double beta = 0.999;
     double eps = 0.8;
     std::size_t max_iters = 2000;

@@ -1,0 +1,487 @@
+\documentclass[11pt,a4paper]{article}
+
+% ----------------------------------------------------
+% PACKAGES ESSENTIELS
+% ----------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath, amssymb}
+\usepackage{siunitx}
+\usepackage{caption}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage[strict]{changepage}
+\usepackage{framed}
+\usepackage{hyperref}
+
+% ----------------------------------------------------
+% PARAMETRES DE MISE EN PAGE
+% ----------------------------------------------------
+\geometry{margin=2.5cm}
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+\setlength{\headheight}{13.6pt}
+\addtolength{\topmargin}{-1.6pt}
+\setlength{\emergencystretch}{2em}
+
+% ----------------------------------------------------
+% COULEURS ENSTA
+% ----------------------------------------------------
+\definecolor{enstaBleuFonce}{HTML}{003366}
+\definecolor{enstaBleuClair}{HTML}{0073CF}
+\definecolor{formalshade}{rgb}{0.95,0.95,1}
+
+% ----------------------------------------------------
+% CONFIGURATION DES LIENS
+% ----------------------------------------------------
+\hypersetup{
+    colorlinks=true,
+    linkcolor=enstaBleuFonce,
+    urlcolor=blue,
+    citecolor=gray
+}
+
+% ----------------------------------------------------
+% STYLE DES SECTIONS
+% ----------------------------------------------------
+\titleformat{\section}[block]
+  {\normalfont\Large\bfseries\color{enstaBleuFonce}}
+  {\thesection}{1em}{}
+  [\vspace{0.3em}\titlerule\color{enstaBleuFonce}\vspace{0.3em}]
+
+\titleformat{\subsection}
+  {\normalfont\large\bfseries\color{enstaBleuClair}}
+  {\thesubsection}{1em}{}
+
+\titleformat{\subsubsection}
+  {\normalfont\normalsize\bfseries\color{black!70}}
+  {\thesubsubsection}{1em}{}
+
+% ----------------------------------------------------
+% EN-TETES ET PIEDS DE PAGE
+% ----------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Ecole Nationale des techniques avancees}
+\fancyhead[R]{OS202}
+\fancyfoot[C]{\thepage}
+
+% ----------------------------------------------------
+% ENVIRONNEMENT FORMAL (ENCADRE)
+% ----------------------------------------------------
+\newenvironment{formal}{%
+\def\FrameCommand{%
+  \hspace{1pt}%
+  {\color{enstaBleuFonce}\vrule width 2pt}%
+  {\color{formalshade}\vrule width 4pt}%
+  \colorbox{formalshade}%
+}%
+\MakeFramed{\advance\hsize-\width\FrameRestore}%
+\noindent\hspace{-4.55pt}%
+\begin{adjustwidth}{}{7pt}%
+\vspace{4pt}%
+}{%
+\vspace{4pt}\end{adjustwidth}\endMakeFramed%
+}
+
+% ====================================================
+% DEBUT DU DOCUMENT
+% ====================================================
+\begin{document}
+
+% ====================================================
+% PAGE DE COUVERTURE
+% ====================================================
+\begin{titlepage}
+    \centering
+    \vspace*{3.2cm}
+
+    \includegraphics[width=0.6\textwidth]{imgs/logo_ensta_2025.png}
+
+    \vspace{0.8cm}
+    {\Large OS202 -- Systemes paralleles et distribues\par}
+    \vspace{0.4cm}
+    {\huge\bfseries Optimisation Par Colonie De Fourmi D'un Chemin Sur Un Paysage Fractal\par}
+
+    \vspace{2.5cm}
+    {\Large MENESES GAMBOA Carlos\par}
+    {\Large VASQUEZ TORRES Jair\par}
+
+    \vfill
+    Ecole Nationale des techniques avancees\\
+    Mars 2026\par
+\end{titlepage}
+
+% ====================================================
+% TABLE DES MATIERES
+% ====================================================
+\newpage
+\tableofcontents
+\newpage
+
+% ====================================================
+% INTRODUCTION GENERALE
+% ====================================================
+\section{Introduction et environnement d'execution}
+TODO : rediger une introduction generale qui presente le projet, les objectifs, le contexte de l'optimisation et les grandes lignes du rapport.
+
+\subsection{Methodologie experimentale et reproductibilite}
+
+\begin{formal}
+Le protocole vise une comparaison reproductible. La graine initiale est fixe a \texttt{2026} dans les executables Qx. Un \emph{warm-up} complet est execute avant les repetitions mesurees afin de chauffer les caches et n'est jamais comptabilise dans les resultats exportes. La validation fonctionnelle repose sur deux indicateurs : \texttt{Food\_KPI}, qui compte la nourriture ramenee au nid, et un \texttt{Checksum} construit a partir de l'etat final des fourmis et des pheromones. Toute optimisation retenue doit conserver ces deux quantites.
+\end{formal}
+
+Le protocole cible du projet est un \textbf{scope compute strict}, c'est-a-dire des mesures concentrees sur la boucle de calcul avec rendu SDL desactive via \texttt{--gui 0}. Cependant, les fichiers archives actuellement presents dans \texttt{results/} contiennent un \texttt{T\_render} non nul, ce qui signifie que la campagne archivée ne correspond pas a un headless strict.
+
+Par rigueur scientifique, le present rapport reproduit donc \textbf{les valeurs effectivement archivees} dans le depot. La campagne instrumentee Q1/Q2 disponible dans \texttt{results/} repose, elle, sur \textbf{5 repetitions} avec warm-up prealable.
+
+\subsection{Machine de test}
+
+Le fichier \texttt{results/machine\_info.txt} n'est pas present dans l'archive courante. Les informations ci-dessous ont donc ete reconstituees a partir de l'environnement d'execution local et des metadonnees deja presentes dans le depot.
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Environnement d'execution utilise pour les mesures et l'analyse.}
+  \label{tab:machine}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    Champ & Valeur \\
+    \midrule
+    Systeme & Linux 6.6.87.2-microsoft-standard-WSL2 x86\_64 \\
+    Processeur & 11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz \\
+    Coeurs physiques & 4 \\
+    Coeurs logiques & 8 \\
+    Threads par coeur & 2 \\
+    Cache L1d / L1i & 192 KiB / 128 KiB \\
+    Cache L2 & 5 MiB \\
+    Cache L3 & 8 MiB \\
+    Memoire vive & 7.6 GiB \\
+    Compilateur C++ & g++ 11.4.0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Organisation du depot}
+
+Le depot est structure par etapes independantes :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{Q0/} : version de reference monocoeur ;
+  \item \texttt{Q1/} : version instrumentee avec decomposition temporelle ;
+  \item \texttt{Q2/} : version SoA et optimisations du noyau chaud ;
+  \item \texttt{results/} : export des mesures numeriques utilisees dans ce rapport.
+\end{itemize}
+
+Cette organisation garantit la tracabilite des modifications et facilite la comparaison entre versions.
+
+% ====================================================
+% Q0
+% ====================================================
+\section{Q0 : Analyse de l'existant et baseline monocoeur}
+
+\subsection{Pipeline applicatif}
+
+Le pipeline global de l'application peut etre resume comme suit :
+
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{
+\centering
+Generation du terrain fractal \\
+$\Downarrow$ \\
+Initialisation des pheromones et des fourmis \\
+$\Downarrow$ \\
+Boucle de simulation \\
+deplacement des fourmis $\rightarrow$ evaporation $\rightarrow$ mise a jour des pheromones $\rightarrow$ rendu / sorties \\
+$\Downarrow$ \\
+Export des temps, du \texttt{Food\_KPI} et du \texttt{Checksum}
+}}
+\end{center}
+
+Cette decomposition met deja en evidence trois blocs de calcul dominants :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item le deplacement des fourmis, avec une complexite proportionnelle au nombre de fourmis et a leur budget de mouvement ;
+  \item l'evaporation globale, qui parcourt la grille complete ;
+  \item la mise a jour des pheromones, elle aussi tres dependante de la taille de la grille.
+\end{itemize}
+
+\subsection{Hotspots theoriques}
+
+Avant toute instrumentation, deux goulots d'etranglement etaient deja identifies.
+
+\subsubsection{Avance des fourmis}
+
+Le deplacement des fourmis constitue le principal candidat au statut de point chaud theorique. Chaque iteration parcourt toutes les fourmis, lit les pheromones voisines, applique une decision exploration / exploitation, met a jour l'etat de charge et peut effectuer plusieurs micro-deplacements avant d'epuiser le budget de temps. Cette phase est a la fois :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item intensive en branchements ;
+  \item sensible a la localite memoire ;
+  \item dependante du generateur pseudo-aleatoire.
+\end{itemize}
+
+\subsubsection{Traitement global de la grille}
+
+L'evaporation et la mise a jour des pheromones parcourent la grille entiere a chaque iteration. Leur cout est donc structurellement lie a la taille du paysage fractal. Ce sont des noyaux plus reguliers que le deplacement des fourmis, mais potentiellement couteux en trafic memoire.
+
+\subsection{Baseline sequentielle}
+
+Le fichier \texttt{results/Q0\_baseline.csv} contient la baseline monocoeur archivee. Il fournit un temps sequentiel de reference \(T_s\) ainsi que les indicateurs de validation.
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Baseline sequentielle Q0 extraite de \texttt{results/Q0\_baseline.csv}.}
+  \label{tab:q0-baseline}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    Metrique & Valeur \\
+    \midrule
+    Nombre de repetitions archivees & 2 \\
+    Temps moyen \(T_s\) & \SI{33788.16}{ms} \\
+    Ecart-type & \SI{2804.10}{ms} \\
+    Premiere iteration avec nourriture & 1236 \\
+    Food\_KPI & 296 \\
+    Checksum & 1641247467920585528 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Cette baseline sert de point de reference algorithmique. Elle montre deja que la simulation complete se situe dans un regime de calcul non trivial et justifie pleinement une instrumentation fine dans l'etape Q1.
+
+% ====================================================
+% Q1
+% ====================================================
+\section{Q1 : Instrumentation et definition du scope}
+
+\subsection{Instrumentation par \texttt{std::chrono}}
+
+L'etape Q1 introduit une instrumentation par sous-etapes a l'aide de \texttt{std::chrono}. Le temps total \texttt{T\_total} encadre la boucle temporelle principale, tandis que quatre sous-mesures sont isolees :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{T\_move\_ants} : deplacement des fourmis ;
+  \item \texttt{T\_evap} : evaporation globale des pheromones ;
+  \item \texttt{T\_pher\_update} : application de la nouvelle carte de pheromones ;
+  \item \texttt{T\_render} : rendu SDL.
+\end{itemize}
+
+Ce decoupage permet de distinguer :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item les noyaux calculatoires internes ;
+  \item le cout de l'interface graphique ;
+  \item la coherence globale entre la somme des sous-etapes et le temps total.
+\end{itemize}
+
+\subsection{Sanity checks et scope de mesure}
+
+Le code affiche un \emph{sanity check} pour verifier que :
+
+\[
+T_{\text{total}} \approx T_{\text{move\_ants}} + T_{\text{evap}} + T_{\text{pher\_update}} + T_{\text{render}}.
+\]
+
+En mode headless, un second controle impose \(T_{\text{render}} \approx 0\). Ce point correspond au scope experimental vise par le projet : isoler strictement le calcul.
+
+Cependant, les CSV archives dans \texttt{results/} pour Q1 contiennent un \texttt{T\_render} non nul. Les valeurs reportees ci-dessous reproduisent donc fidelement la campagne disponible, et non une campagne recalculée en \texttt{--gui 0}.
+
+\subsection{Tableau de resultats Q1}
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Decomposition temporelle Q1 extraite de \texttt{results/Q1\_timings\_breakdown.csv}.}
+  \label{tab:q1-breakdown}
+  \begin{tabular}{@{}lrrr@{}}
+    \toprule
+    Sous-etape & Moyenne (ms) & Ecart-type (ms) & Part dans \(T_{\text{total}}\) \\
+    \midrule
+    \(T_{\text{move\_ants}}\) & 15253.78 & 1898.42 & 18.13 \% \\
+    \(T_{\text{evap}}\) & 1664.29 & 48.18 & 1.98 \% \\
+    \(T_{\text{pher\_update}}\) & 38.92 & 3.79 & 0.05 \% \\
+    \(T_{\text{render}}\) & 67094.22 & 1198.94 & 79.76 \% \\
+    \(T_{\text{total}}\) & 84118.09 & 2178.69 & 100.00 \% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Les indicateurs fonctionnels associes a cette campagne sont :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{First\_Iteration = 1236}
+  \item \texttt{Food\_KPI = 4353}
+  \item \texttt{Checksum = 1479050492479337403}
+\end{itemize}
+
+La conclusion operationnelle de Q1 est donc claire : pour accelerer la simulation, il faut prioritairement attaquer le noyau \texttt{move\_ants}, puis seulement dans un second temps les traitements plus reguliers comme l'evaporation.
+
+% ====================================================
+% Q2
+% ====================================================
+\section{Q2 : Vectorisation (AoS vs SoA) et optimisations}
+
+\subsection{Theorie : passage de AoS a SoA}
+
+L'objectif theorique de Q2 etait de transformer le stockage des fourmis depuis une organisation de type \emph{Array of Structures} (AoS) vers une organisation \emph{Structure of Arrays} (SoA). Dans la version de reference, chaque fourmi etait un objet `ant` contenant simultanement :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item sa graine pseudo-aleatoire ;
+  \item son etat charge / non charge ;
+  \item sa position courante.
+\end{itemize}
+
+En Q2, ces informations sont stockees dans des tableaux separes :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{m\_x} ;
+  \item \texttt{m\_y} ;
+  \item \texttt{m\_is\_loaded} ;
+  \item \texttt{m\_seed}.
+\end{itemize}
+
+L'interet attendu d'une telle transformation est classique en calcul haute performance :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item meilleure localite spatiale ;
+  \item meilleure exploitation des lignes de cache ;
+  \item acces memoire plus reguliers ;
+  \item fondation plus favorable a une vectorisation automatique ulterieure.
+\end{itemize}
+
+\subsection{Le paradoxe des performances : pourquoi SoA n'a pas apporte un gain magique}
+
+L'analyse du code et des premiers essais a montre un point important : la version AoS initiale etait deja relativement compacte et bien adaptee au cache. Les objets \texttt{ant} restaient de petite taille et etaient stockes de maniere contigue dans un \texttt{std::vector<ant>}. Le passage a SoA n'attaquait donc pas un probleme memoire catastrophique.
+
+En parallele, le noyau \texttt{advance\_one} reste difficile a vectoriser automatiquement car il contient :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item des branchements dependant de l'etat de la fourmi ;
+  \item des choix exploration / exploitation ;
+  \item un \texttt{do/while} dans la branche d'exploration ;
+  \item des trajectoires qui dependent des donnees et des tirages pseudo-aleatoires.
+\end{itemize}
+
+Le rapport du compilateur, synthese dans \texttt{Q2/results/reviews/revue\_vectorisation\_ant.md}, confirme cette lecture. Aucun des signaux utiles n'est marque comme \texttt{optimized}; au contraire, le compilateur remonte des causes telles que \texttt{couldn't vectorize loop} ou \texttt{number of iterations cannot be computed}. En pratique, SoA etait une condition necessaire pour assainir le stockage, mais certainement pas une condition suffisante pour obtenir une vectorisation SIMD complete.
+
+\subsection{Les vraies optimisations du code final}
+
+La baisse du temps d'execution observee en Q2 provient en realite de plusieurs optimisations concretes du point chaud \texttt{move\_ants}.
+
+\subsubsection{Preallocation des structures auxiliaires}
+
+La methode \texttt{resize} prealloue les tampons de travail :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{consumed\_time} ;
+  \item \texttt{active\_loaded\_ids} ;
+  \item \texttt{active\_unloaded\_ids} ;
+  \item \texttt{next\_loaded\_ids} ;
+  \item \texttt{next\_unloaded\_ids}.
+\end{itemize}
+
+Ce choix evite des allocations dynamiques dans la boucle chaude et stabilise le cout de l'ordonnancement par rondes.
+
+\subsubsection{Separation des fourmis selon l'etat}
+
+Les fourmis actives sont traitees en deux groupes, \texttt{loaded} et \texttt{unloaded}. Cette separation supprime un branchement recurrent pour choisir le canal de pheromone et simplifie le flot de controle.
+
+\subsubsection{Reduction du cout du generateur pseudo-aleatoire}
+
+Le gain majeur vient de la specialisation des tirages aleatoires.
+
+En Q1, le noyau chaud utilisait des helpers generiques :
+
+\begin{verbatim}
+rand_double(0., 1., seed)
+rand_int32(1, 4, seed)
+\end{verbatim}
+
+En Q2, ces appels sont remplaces par :
+
+\begin{verbatim}
+next_seed(seed)
+rand_choice_01(seed)
+rand_dir_14(seed)
+\end{verbatim}
+
+Cette modification reduit le cout CPU pour plusieurs raisons :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item suppression de l'appel a \texttt{std::fmod} dans le noyau chaud ;
+  \item specialisation exacte des deux usages reels du RNG ;
+  \item reduction des calculs generiques lies aux bornes \texttt{min\_val} / \texttt{max\_val} ;
+  \item meilleur potentiel d'integration directe par le compilateur.
+\end{itemize}
+
+Autrement dit, l'acceleration finale ne vient pas d'une vectorisation automatique complete, mais d'un allegement massif du calcul scalaire repete a tres haute frequence.
+
+\subsubsection{Autres ameliorations structurelles}
+
+Le code final retient egalement :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item le passage de \texttt{std::vector<bool>} a \texttt{std::vector<std::uint8\_t>} pour l'etat des fourmis ;
+  \item le passage de \texttt{std::size\_t} a \texttt{std::uint32\_t} pour les graines ;
+  \item l'appel direct a \texttt{mark\_pheronome\_xy} pour simplifier legerement la mise a jour des pheromones.
+\end{itemize}
+
+\subsection{Tableau comparatif Q1 vs Q2}
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Comparaison des moyennes Q1 / Q2 a partir des fichiers de \texttt{results/}.}
+  \label{tab:q1-q2-compare}
+  \begin{tabular}{@{}lrrrr@{}}
+    \toprule
+    Metrique & Q1 (ms) & Q2 (ms) & Gain relatif & Facteur d'acceleration \\
+    \midrule
+    \(T_{\text{move\_ants}}\) & 15253.78 & 6684.21 & -56.18 \% & 2.282x \\
+    \(T_{\text{evap}}\) & 1664.29 & 1532.42 & -7.92 \% & 1.086x \\
+    \(T_{\text{pher\_update}}\) & 38.92 & 38.40 & -1.35 \% & 1.014x \\
+    \(T_{\text{render}}\) & 67094.22 & 64683.76 & -3.59 \% & 1.037x \\
+    \(T_{\text{total}}\) & 84118.09 & 73000.54 & -13.22 \% & 1.152x \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Reproductibilite et validation fonctionnelle}
+
+Les indicateurs de validation restent rigoureusement identiques entre Q1 et Q2 :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{First\_Iteration = 1236}
+  \item \texttt{Food\_KPI = 4353}
+  \item \texttt{Checksum = 1479050492479337403}
+\end{itemize}
+
+Cette identite confirme que les optimisations introduites en Q2 ne modifient pas la logique sequentielle de reference. Le gain observe correspond bien a une acceleration d'execution, et non a une derivation du calcul.
+
+\subsection{Conclusion Q2}
+
+La Q2 montre une lecon importante en optimisation haute performance :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item le passage AoS -> SoA, pris isolenment, n'apporte pas necessairement un gain spectaculaire ;
+  \item le rapport du compilateur est indispensable pour distinguer ce qui est vectorisable de ce qui ne l'est pas ;
+  \item dans ce projet, les gains decisifs proviennent surtout de la simplification du noyau chaud et de la specialisation du generateur pseudo-aleatoire.
+\end{itemize}
+
+Le resultat est toutefois net :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item le temps de deplacement des fourmis est reduit d'un facteur \(2.282\times\) ;
+  \item le temps total est reduit d'un facteur \(1.152\times\) ;
+  \item la correction fonctionnelle est preservee.
+\end{itemize}
+
+Q2 constitue donc une etape techniquement reussie non pas parce qu'elle aurait force une vectorisation SIMD parfaite, mais parce qu'elle a permis de transformer un diagnostic de performance en optimisations concretes, mesurables et correctes.
+
+\end{document}

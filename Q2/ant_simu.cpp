@@ -424,9 +424,9 @@ MesuresRepetition executer_repetition(const Config& cfg,
         }
 
         const auto debut_move = horloge::now();
-        for (std::size_t i = 0; i < ants.size(); ++i) {
-            ants.advance_one(i, phen, land, pos_food, pos_nest, food_quantity);
-        }
+
+        ants.advance_one(phen, land, pos_food, pos_nest, food_quantity);
+
         const auto fin_move = horloge::now();
         mesures.t_move_ants_ms += std::chrono::duration<double, std::milli>(fin_move - debut_move).count();
 

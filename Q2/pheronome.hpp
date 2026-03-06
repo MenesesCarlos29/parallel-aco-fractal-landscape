@@ -64,6 +64,10 @@ public:
 
     size_t dimensions() const { return m_dim; }
 
+    size_t stride() const { return m_stride; }
+    
+    const pheronome_t* data() const { return m_map_of_pheronome.data(); }
+
     void do_evaporation( ) {
         for ( std::size_t i = 1; i <= m_dim; ++i )
             for ( std::size_t j = 1; j <= m_dim; ++j ) {
@@ -71,33 +75,33 @@ public:
                 m_buffer_pheronome[i * m_stride + j][1] *= m_beta;
             }
     }
+    void mark_pheronome_xy(std::size_t i, std::size_t j) {
+        assert(i < m_dim);
+        assert(j < m_dim);
+        pheronome& phen = *this;
+        const pheronome_t& left_cell   = phen(i - 1, j);
+        const pheronome_t& right_cell  = phen(i + 1, j);
+        const pheronome_t& upper_cell  = phen(i, j - 1);
+        const pheronome_t& bottom_cell = phen(i, j + 1);
+        double v1_left   = std::max(left_cell[0], 0.);
+        double v2_left   = std::max(left_cell[1], 0.);
+        double v1_right  = std::max(right_cell[0], 0.);
+        double v2_right  = std::max(right_cell[1], 0.);
+        double v1_upper  = std::max(upper_cell[0], 0.);
+        double v2_upper  = std::max(upper_cell[1], 0.);
+        double v1_bottom = std::max(bottom_cell[0], 0.);
+        double v2_bottom = std::max(bottom_cell[1], 0.);
+        m_buffer_pheronome[(i + 1) * m_stride + (j + 1)][0] =
+            m_alpha * std::max({v1_left, v1_right, v1_upper, v1_bottom}) +
+            (1 - m_alpha) * 0.25 * (v1_left + v1_right + v1_upper + v1_bottom);
+        m_buffer_pheronome[(i + 1) * m_stride + (j + 1)][1] =
+            m_alpha * std::max({v2_left, v2_right, v2_upper, v2_bottom}) +
+            (1 - m_alpha) * 0.25 * (v2_left + v2_right + v2_upper + v2_bottom);
+    }
+
 
     void mark_pheronome( const position_t& pos ) {
-      std::size_t i = pos.x;
-      std::size_t j = pos.y;
-        assert( i >= 0 );
-        assert( j >= 0 );
-        assert( i < m_dim );
-        assert( j < m_dim );
-        pheronome&         phen        = *this;
-        const pheronome_t& left_cell   = phen( i - 1, j );
-        const pheronome_t& right_cell  = phen( i + 1, j );
-        const pheronome_t& upper_cell  = phen( i, j - 1 );
-        const pheronome_t& bottom_cell = phen( i, j + 1 );
-        double             v1_left     = std::max( left_cell[0], 0. );
-        double             v2_left     = std::max( left_cell[1], 0. );
-        double             v1_right    = std::max( right_cell[0], 0. );
-        double             v2_right    = std::max( right_cell[1], 0. );
-        double             v1_upper    = std::max( upper_cell[0], 0. );
-        double             v2_upper    = std::max( upper_cell[1], 0. );
-        double             v1_bottom   = std::max( bottom_cell[0], 0. );
-        double             v2_bottom   = std::max( bottom_cell[1], 0. );
-        m_buffer_pheronome[( i + 1 ) * m_stride + ( j + 1 )][0] =
-            m_alpha * std::max( {v1_left, v1_right, v1_upper, v1_bottom} ) +
-            ( 1 - m_alpha ) * 0.25 * ( v1_left + v1_right + v1_upper + v1_bottom );
-        m_buffer_pheronome[( i + 1 ) * m_stride + ( j + 1 )][1] =
-            m_alpha * std::max( {v2_left, v2_right, v2_upper, v2_bottom} ) +
-            ( 1 - m_alpha ) * 0.25 * ( v2_left + v2_right + v2_upper + v2_bottom );
+       mark_pheronome_xy(pos.x, pos.y);
     }
 
     void update( ) {

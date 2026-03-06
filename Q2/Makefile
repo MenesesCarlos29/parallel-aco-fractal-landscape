@@ -3,7 +3,7 @@ include Make_linux.inc
 #include Make_osx.inc
 
 CXXFLAGS = -std=c++17
-ifdef DEBUG
+ifeq ($(DEBUG),yes)
 CXXFLAGS += -g -O0 -Wall -fbounds-check -pedantic -D_GLIBCXX_DEBUG
 else
 CXXFLAGS += -O3 -march=native -Wall

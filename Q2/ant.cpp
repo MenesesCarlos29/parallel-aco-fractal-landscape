@@ -13,8 +13,28 @@ void AntSwarm::resize(std::size_t nb_ants)
 {
     m_x.assign(nb_ants, 0);
     m_y.assign(nb_ants, 0);
-    m_is_loaded.assign(nb_ants, false);
+    m_is_loaded.assign(nb_ants, 0);
     m_seed.assign(nb_ants, 0);
+    consumed_time.resize(nb_ants);
+    active_loaded_ids.resize(nb_ants);
+    active_unloaded_ids.resize(nb_ants);
+    next_loaded_ids.resize(nb_ants);
+    next_unloaded_ids.resize(nb_ants);
+}
+static inline std::uint32_t next_seed(std::uint32_t& seed)
+{
+    seed = static_cast<std::uint32_t>((1664525ull * seed + 1013904223ull) % 0xFFFFFFFFu);
+    return seed;
+}
+
+static inline double rand_choice_01(std::uint32_t& seed)
+{
+    return static_cast<double>(next_seed(seed) % 2u);
+}
+
+static inline int rand_dir_14(std::uint32_t& seed)
+{
+    return 1 + static_cast<int>(next_seed(seed) % 4u);
 }
 
 void AntSwarm::initialiser_positions_aleatoires(const fractal_land& land, std::size_t& seed_global)
@@ -23,70 +43,134 @@ void AntSwarm::initialiser_positions_aleatoires(const fractal_land& land, std::s
         return rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), seed_global);
     };
 
-    for (std::size_t i = 0; i < size(); ++i) {
+    for (std::size_t i = 0; i < m_x.size(); ++i) {
         m_x[i] = gen_ant_pos();
         m_y[i] = gen_ant_pos();
-        m_is_loaded[i] = false;
+        m_is_loaded[i] = 0;
         m_seed[i] = seed_global;
     }
 }
 
-void AntSwarm::advance_one(std::size_t ant_id, pheronome& phen, const fractal_land& land,
+void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
                            const position_t& pos_food, const position_t& pos_nest, std::size_t& cpteur_food)
 {
-    auto ant_choice = [this, ant_id]() mutable { return rand_double(0., 1., this->m_seed[ant_id]); };
-    auto dir_choice = [this, ant_id]() mutable { return rand_int32(1, 4, this->m_seed[ant_id]); };
-    double consumed_time = 0.;
+    // Debut d'une iteration globale: toutes les fourmis ont un budget de deplacement nul consomme.
+    std::fill(consumed_time.begin(), consumed_time.end(), 0.0);
 
-    // Tant que la fourmi peut encore bouger dans le pas de temps imparti
-    while ( consumed_time < 1. ) {
-        // Si la fourmi est chargée, elle suit les phéromones de deuxième type, sinon ceux du premier.
-        int        ind_pher    = ( m_is_loaded[ant_id] ? 1 : 0 );
-        double     choix       = ant_choice( );
-        position_t old_pos_ant{m_x[ant_id], m_y[ant_id]};
-        position_t new_pos_ant = old_pos_ant;
-        const position_t pos_gauche{new_pos_ant.x - 1, new_pos_ant.y};
-        const position_t pos_droite{new_pos_ant.x + 1, new_pos_ant.y};
-        const position_t pos_haut{new_pos_ant.x, new_pos_ant.y - 1};
-        const position_t pos_bas{new_pos_ant.x, new_pos_ant.y + 1};
-        double max_phen    = std::max( {phen[pos_gauche][ind_pher],
-                                     phen[pos_droite][ind_pher],
-                                     phen[pos_haut][ind_pher],
-                                     phen[pos_bas][ind_pher]} );
-        if ( ( choix > m_eps ) || ( max_phen <= 0. ) ) {
-            do {
-                new_pos_ant = old_pos_ant;
-                int d = dir_choice();
-                if ( d==1 ) new_pos_ant.x  -= 1;
-                if ( d==2 ) new_pos_ant.y -= 1;
-                if ( d==3 ) new_pos_ant.x  += 1;
-                if ( d==4 ) new_pos_ant.y += 1;
+    // Separation des fourmis actives par etat pour eviter un branchement dans le noyau chaud.
+    std::size_t active_loaded_count = 0;
+    std::size_t active_unloaded_count = 0;
 
-            } while ( phen[new_pos_ant][ind_pher] == -1 );
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(m_x.size()); ++i) {
+        if (m_is_loaded[i]) {
+            active_loaded_ids[active_loaded_count++] = i;
         } else {
-            // On choisit la case où le phéromone est le plus fort.
-            if ( phen[pos_gauche][ind_pher] == max_phen )
-                new_pos_ant.x -= 1;
-            else if ( phen[pos_droite][ind_pher] == max_phen )
-                new_pos_ant.x += 1;
-            else if ( phen[pos_haut][ind_pher] == max_phen )
-                new_pos_ant.y -= 1;
-            else  // if (phen(new_pos_ant.first,new_pos_ant.second+1)[ind_pher] == max_phen)
-                new_pos_ant.y += 1;
+            active_unloaded_ids[active_unloaded_count++] = i;
         }
-        consumed_time += land( new_pos_ant.x, new_pos_ant.y);
-        phen.mark_pheronome( new_pos_ant );
-        m_x[ant_id] = new_pos_ant.x;
-        m_y[ant_id] = new_pos_ant.y;
+    }
 
-        if ( new_pos_ant == pos_nest ) {
-            if ( m_is_loaded[ant_id] ) {
-                cpteur_food += 1;
+    auto traiter_liste = [&](std::vector<std::uint32_t>& liste_active,
+                             std::size_t nb_actives,
+                             int ind_pher,
+                             std::vector<std::uint32_t>& liste_next_loaded,
+                             std::size_t& nb_next_loaded,
+                             std::vector<std::uint32_t>& liste_next_unloaded,
+                             std::size_t& nb_next_unloaded)
+    {
+        for (std::size_t pos = 0; pos < nb_actives; ++pos) {
+            const std::uint32_t i = liste_active[pos];
+
+            double choix = rand_choice_01(m_seed[i]);
+            position_t old_pos_ant{m_x[i], m_y[i]};
+            position_t new_pos_ant = old_pos_ant;
+
+            const position_t pos_gauche{new_pos_ant.x - 1, new_pos_ant.y};
+            const position_t pos_droite{new_pos_ant.x + 1, new_pos_ant.y};
+            const position_t pos_haut{new_pos_ant.x, new_pos_ant.y - 1};
+            const position_t pos_bas{new_pos_ant.x, new_pos_ant.y + 1};
+
+            double max_phen = std::max({phen[pos_gauche][ind_pher],
+                                        phen[pos_droite][ind_pher],
+                                        phen[pos_haut][ind_pher],
+                                        phen[pos_bas][ind_pher]});
+
+            if ((choix > m_eps) || (max_phen <= 0.0)) {
+                do {
+                    new_pos_ant = old_pos_ant;
+                    int d = rand_dir_14(m_seed[i]);
+
+                    if (d == 1) new_pos_ant.x -= 1;
+                    if (d == 2) new_pos_ant.y -= 1;
+                    if (d == 3) new_pos_ant.x += 1;
+                    if (d == 4) new_pos_ant.y += 1;
+
+                } while (phen[new_pos_ant][ind_pher] == -1.0);
+            } else {
+                if (phen[pos_gauche][ind_pher] == max_phen)
+                    new_pos_ant.x -= 1;
+                else if (phen[pos_droite][ind_pher] == max_phen)
+                    new_pos_ant.x += 1;
+                else if (phen[pos_haut][ind_pher] == max_phen)
+                    new_pos_ant.y -= 1;
+                else
+                    new_pos_ant.y += 1;
             }
-            m_is_loaded[ant_id] = false;
+
+            phen.mark_pheronome_xy(static_cast<std::size_t>(new_pos_ant.x),
+                                   static_cast<std::size_t>(new_pos_ant.y));
+
+            m_x[i] = new_pos_ant.x;
+            m_y[i] = new_pos_ant.y;
+
+            if (new_pos_ant == pos_nest) {
+                if (m_is_loaded[i] != 0) {
+                    ++cpteur_food;
+                }
+                m_is_loaded[i] = 0;
+            }
+
+            if (new_pos_ant == pos_food) {
+                m_is_loaded[i] = 1;
+            }
+
+            consumed_time[i] += land(static_cast<unsigned long>(new_pos_ant.x),
+                                     static_cast<unsigned long>(new_pos_ant.y));
+
+            if (consumed_time[i] < 1.0) {
+                if (m_is_loaded[i] != 0) {
+                    liste_next_loaded[nb_next_loaded++] = i;
+                } else {
+                    liste_next_unloaded[nb_next_unloaded++] = i;
+                }
+            }
         }
-        if ( new_pos_ant == pos_food ) {
-            m_is_loaded[ant_id] = true;
-        }
+    };
+
+    // Ordonnancement par rondes: chaque fourmi active effectue un micro-deplacement par tour.
+    while ((active_loaded_count + active_unloaded_count) != 0) {
+        std::size_t next_loaded_count = 0;
+        std::size_t next_unloaded_count = 0;
+
+        traiter_liste(active_unloaded_ids,
+                      active_unloaded_count,
+                      0,
+                      next_loaded_ids,
+                      next_loaded_count,
+                      next_unloaded_ids,
+                      next_unloaded_count);
+
+        traiter_liste(active_loaded_ids,
+                      active_loaded_count,
+                      1,
+                      next_loaded_ids,
+                      next_loaded_count,
+                      next_unloaded_ids,
+                      next_unloaded_count);
+
+        std::swap(active_loaded_ids, next_loaded_ids);
+        std::swap(active_unloaded_ids, next_unloaded_ids);
+
+        active_loaded_count = next_loaded_count;
+        active_unloaded_count = next_unloaded_count;
     }
 }

@@ -1,0 +1,193 @@
+#include "ant.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <omp.h>
+#include "rand_generator.hpp"
+
+double AntSwarm::m_eps = 0.;
+
+AntSwarm::AntSwarm(std::size_t nb_ants)
+{
+    resize(nb_ants);
+}
+
+void AntSwarm::resize(std::size_t nb_ants)
+{
+    m_x.assign(nb_ants, 0);
+    m_y.assign(nb_ants, 0);
+    m_is_loaded.assign(nb_ants, 0);
+    m_seed.assign(nb_ants, 0);
+    consumed_time.resize(nb_ants);
+    active_loaded_ids.resize(nb_ants);
+    active_unloaded_ids.resize(nb_ants);
+    next_loaded_ids.resize(nb_ants);
+    next_unloaded_ids.resize(nb_ants);
+}
+static inline std::uint32_t next_seed(std::uint32_t& seed)
+{
+    seed = static_cast<std::uint32_t>((1664525ull * seed + 1013904223ull) % 0xFFFFFFFFu);
+    return seed;
+}
+
+static inline double rand_choice_01(std::uint32_t& seed)
+{
+    return static_cast<double>(next_seed(seed) % 2u);
+}
+
+static inline int rand_dir_14(std::uint32_t& seed)
+{
+    return 1 + static_cast<int>(next_seed(seed) % 4u);
+}
+
+void AntSwarm::initialiser_positions_aleatoires(const fractal_land& land, std::size_t& seed_global)
+{
+    auto gen_ant_pos = [&land, &seed_global]() {
+        return rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), seed_global);
+    };
+
+    for (std::size_t i = 0; i < m_x.size(); ++i) {
+        m_x[i] = gen_ant_pos();
+        m_y[i] = gen_ant_pos();
+        m_is_loaded[i] = 0;
+        m_seed[i] = seed_global;
+    }
+}
+
+void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
+                           const position_t& pos_food, const position_t& pos_nest, std::size_t& cpteur_food)
+{
+    // Debut d'une iteration globale: toutes les fourmis ont un budget de deplacement nul consomme.
+    std::fill(consumed_time.begin(), consumed_time.end(), 0.0);
+
+    // Separation des fourmis actives par etat pour eviter un branchement dans le noyau chaud.
+    std::size_t active_loaded_count = 0;
+    std::size_t active_unloaded_count = 0;
+
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(m_x.size()); ++i) {
+        if (m_is_loaded[i]) {
+            active_loaded_ids[active_loaded_count++] = i;
+        } else {
+            active_unloaded_ids[active_unloaded_count++] = i;
+        }
+    }
+
+    auto traiter_liste = [&](std::vector<std::uint32_t>& liste_active,
+                             std::size_t nb_actives,
+                             int ind_pher,
+                             std::vector<std::uint32_t>& liste_next_loaded,
+                             std::size_t& nb_next_loaded,
+                             std::vector<std::uint32_t>& liste_next_unloaded,
+                             std::size_t& nb_next_unloaded)
+    {
+        #pragma omp parallel for schedule(static)
+        for (std::int64_t pos = 0; pos < static_cast<std::int64_t>(nb_actives); ++pos) {
+            const std::uint32_t i = liste_active[static_cast<std::size_t>(pos)];
+
+            double choix = rand_choice_01(m_seed[i]);
+            position_t old_pos_ant{m_x[i], m_y[i]};
+            position_t new_pos_ant = old_pos_ant;
+
+            const position_t pos_gauche{new_pos_ant.x - 1, new_pos_ant.y};
+            const position_t pos_droite{new_pos_ant.x + 1, new_pos_ant.y};
+            const position_t pos_haut{new_pos_ant.x, new_pos_ant.y - 1};
+            const position_t pos_bas{new_pos_ant.x, new_pos_ant.y + 1};
+
+            double max_phen = std::max({phen[pos_gauche][ind_pher],
+                                        phen[pos_droite][ind_pher],
+                                        phen[pos_haut][ind_pher],
+                                        phen[pos_bas][ind_pher]});
+
+            if ((choix > m_eps) || (max_phen <= 0.0)) {
+                do {
+                    new_pos_ant = old_pos_ant;
+                    int d = rand_dir_14(m_seed[i]);
+
+                    if (d == 1) new_pos_ant.x -= 1;
+                    if (d == 2) new_pos_ant.y -= 1;
+                    if (d == 3) new_pos_ant.x += 1;
+                    if (d == 4) new_pos_ant.y += 1;
+
+                } while (phen[new_pos_ant][ind_pher] == -1.0);
+            } else {
+                if (phen[pos_gauche][ind_pher] == max_phen)
+                    new_pos_ant.x -= 1;
+                else if (phen[pos_droite][ind_pher] == max_phen)
+                    new_pos_ant.x += 1;
+                else if (phen[pos_haut][ind_pher] == max_phen)
+                    new_pos_ant.y -= 1;
+                else
+                    new_pos_ant.y += 1;
+            }
+
+            // Protection anti-race: plusieurs fourmis peuvent marquer la même cellule en parallèle.
+            #pragma omp critical(mise_a_jour_pheromone)
+            {
+                phen.mark_pheronome_xy(static_cast<std::size_t>(new_pos_ant.x),
+                                       static_cast<std::size_t>(new_pos_ant.y));
+            }
+
+            m_x[i] = new_pos_ant.x;
+            m_y[i] = new_pos_ant.y;
+
+            if (new_pos_ant == pos_nest) {
+                if (m_is_loaded[i] != 0) {
+                    // Protection anti-race: compteur global partagé entre threads.
+                    #pragma omp atomic update
+                    ++cpteur_food;
+                }
+                m_is_loaded[i] = 0;
+            }
+
+            if (new_pos_ant == pos_food) {
+                m_is_loaded[i] = 1;
+            }
+
+            consumed_time[i] += land(static_cast<unsigned long>(new_pos_ant.x),
+                                     static_cast<unsigned long>(new_pos_ant.y));
+
+            if (consumed_time[i] < 1.0) {
+                if (m_is_loaded[i] != 0) {
+                    std::size_t index_ecriture = 0;
+                    // Protection anti-race: réservation atomique d'un index d'insertion.
+                    #pragma omp atomic capture
+                    index_ecriture = nb_next_loaded++;
+                    liste_next_loaded[index_ecriture] = i;
+                } else {
+                    std::size_t index_ecriture = 0;
+                    // Protection anti-race: réservation atomique d'un index d'insertion.
+                    #pragma omp atomic capture
+                    index_ecriture = nb_next_unloaded++;
+                    liste_next_unloaded[index_ecriture] = i;
+                }
+            }
+        }
+    };
+
+    // Ordonnancement par rondes: chaque fourmi active effectue un micro-deplacement par tour.
+    while ((active_loaded_count + active_unloaded_count) != 0) {
+        std::size_t next_loaded_count = 0;
+        std::size_t next_unloaded_count = 0;
+
+        traiter_liste(active_unloaded_ids,
+                      active_unloaded_count,
+                      0,
+                      next_loaded_ids,
+                      next_loaded_count,
+                      next_unloaded_ids,
+                      next_unloaded_count);
+
+        traiter_liste(active_loaded_ids,
+                      active_loaded_count,
+                      1,
+                      next_loaded_ids,
+                      next_loaded_count,
+                      next_unloaded_ids,
+                      next_unloaded_count);
+
+        std::swap(active_loaded_ids, next_loaded_ids);
+        std::swap(active_unloaded_ids, next_unloaded_ids);
+
+        active_loaded_count = next_loaded_count;
+        active_unloaded_count = next_unloaded_count;
+    }
+}

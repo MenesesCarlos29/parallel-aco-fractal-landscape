@@ -8,7 +8,6 @@
 \usepackage[french]{babel}
 \usepackage{geometry}
 \usepackage{graphicx}
-\usepackage{amsmath, amssymb}
 \usepackage{siunitx}
 \usepackage{caption}
 \usepackage{booktabs}
@@ -130,7 +129,8 @@
 % INTRODUCTION GENERALE
 % ====================================================
 \section{Introduction et environnement d'execution}
-TODO : rediger une introduction generale qui presente le projet, les objectifs, le contexte de l'optimisation et les grandes lignes du rapport.
+
+Ce projet etudie l'optimisation d'une simulation de colonie de fourmis sur paysage fractal, avec une progression volontairement structuree en quatre etapes. Q0 etablit la baseline monocoeur et l'analyse des hotspots, Q1 introduit l'instrumentation temporelle, Q2 restructure les donnees et simplifie le noyau chaud, puis Q3 ajoute une parallelisation OpenMP en memoire partagee. Le fil directeur du rapport est de distinguer clairement les gains dus a la mesure, a l'organisation memoire, puis a la parallelisation, tout en verifiant a chaque etape la reproductibilite fonctionnelle.
 
 \subsection{Methodologie experimentale et reproductibilite}
 
@@ -138,9 +138,9 @@ TODO : rediger une introduction generale qui presente le projet, les objectifs, 
 Le protocole vise une comparaison reproductible. La graine initiale est fixe a \texttt{2026} dans les executables Qx. Un \emph{warm-up} complet est execute avant les repetitions mesurees afin de chauffer les caches et n'est jamais comptabilise dans les resultats exportes. La validation fonctionnelle repose sur deux indicateurs : \texttt{Food\_KPI}, qui compte la nourriture ramenee au nid, et un \texttt{Checksum} construit a partir de l'etat final des fourmis et des pheromones. Toute optimisation retenue doit conserver ces deux quantites.
 \end{formal}
 
-Le protocole cible du projet est un \textbf{scope compute strict}, c'est-a-dire des mesures concentrees sur la boucle de calcul avec rendu SDL desactive via \texttt{--gui 0}. Cependant, les fichiers archives actuellement presents dans \texttt{results/} contiennent un \texttt{T\_render} non nul, ce qui signifie que la campagne archivée ne correspond pas a un headless strict.
+Le protocole scientifique vise un \textbf{scope compute strict}, c'est-a-dire des mesures concentrees sur la boucle de calcul avec rendu SDL desactive via \texttt{--gui 0}. En pratique, le depot conserve deux familles de campagnes : les campagnes historiques Q0 et Q1, qui correspondent a des executions completes avec influence du rendu, et les campagnes finales Q2 et Q3, qui ont ete consolidees en mode headless pour isoler le calcul. Le rapport signale explicitement cette difference afin d'eviter toute comparaison abusive entre temps applicatifs complets et temps purement compute.
 
-Par rigueur scientifique, le present rapport reproduit donc \textbf{les valeurs effectivement archivees} dans le depot. La campagne instrumentee Q1/Q2 disponible dans \texttt{results/} repose, elle, sur \textbf{5 repetitions} avec warm-up prealable.
+Toutes les campagnes exploitees dans ce document reposent sur \textbf{5 repetitions} avec warm-up prealable, mais leur perimetre de mesure n'est pas uniforme entre les premieres etapes et les campagnes finales.
 
 \subsection{Machine de test}
 
@@ -177,7 +177,9 @@ Le depot est structure par etapes independantes :
   \item \texttt{Q0/} : version de reference monocoeur ;
   \item \texttt{Q1/} : version instrumentee avec decomposition temporelle ;
   \item \texttt{Q2/} : version SoA et optimisations du noyau chaud ;
-  \item \texttt{results/} : export des mesures numeriques utilisees dans ce rapport.
+  \item \texttt{Q3/} : version OpenMP en memoire partagee ;
+  \item \texttt{results/} : mesures historiques et campagnes compute intermediaires ;
+  \item \texttt{final\_results/} : campagne finale Q3 et figures de scalabilite.
 \end{itemize}
 
 Cette organisation garantit la tracabilite des modifications et facilite la comparaison entre versions.
@@ -233,7 +235,7 @@ L'evaporation et la mise a jour des pheromones parcourent la grille entiere a ch
 
 \subsection{Baseline sequentielle}
 
-Le fichier \texttt{results/Q0\_baseline.csv} contient la baseline monocoeur archivee. Il fournit un temps sequentiel de reference \(T_s\) ainsi que les indicateurs de validation.
+Le fichier \texttt{results/Q0\_baseline.csv} contient la baseline monocoeur archivee. Cette mesure correspond a une execution applicative complete de reference, anterieure a l'isolation stricte du scope compute.
 
 \begin{table}[H]
   \centering
@@ -244,17 +246,17 @@ Le fichier \texttt{results/Q0\_baseline.csv} contient la baseline monocoeur arch
     \toprule
     Metrique & Valeur \\
     \midrule
-    Nombre de repetitions archivees & 2 \\
-    Temps moyen \(T_s\) & \SI{33788.16}{ms} \\
-    Ecart-type & \SI{2804.10}{ms} \\
+    Nombre de repetitions archivees & 5 \\
+    Temps moyen \(T_s\) & \SI{85520.09}{ms} \\
+    Ecart-type & \SI{2384.22}{ms} \\
     Premiere iteration avec nourriture & 1236 \\
-    Food\_KPI & 296 \\
-    Checksum & 1641247467920585528 \\
+    Food\_KPI & 4353 \\
+    Checksum & 1479050492479337403 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-Cette baseline sert de point de reference algorithmique. Elle montre deja que la simulation complete se situe dans un regime de calcul non trivial et justifie pleinement une instrumentation fine dans l'etape Q1.
+Cette baseline sert de point de reference algorithmique et applicatif. Elle montre que la simulation complete se situe deja dans un regime de calcul non trivial, tout en rappelant qu'a ce stade le rendu reste melange au temps total observe.
 
 % ====================================================
 % Q1
@@ -320,7 +322,7 @@ Les indicateurs fonctionnels associes a cette campagne sont :
   \item \texttt{Checksum = 1479050492479337403}
 \end{itemize}
 
-La conclusion operationnelle de Q1 est donc claire : pour accelerer la simulation, il faut prioritairement attaquer le noyau \texttt{move\_ants}, puis seulement dans un second temps les traitements plus reguliers comme l'evaporation.
+La conclusion operationnelle de Q1 doit etre lue a deux niveaux. Sur le temps applicatif complet archive, le rendu domine largement le wall-time. En revanche, a l'interieur du scope compute vise par le projet, le noyau \texttt{move\_ants} reste de loin le principal hotspot calculatoire, devant l'evaporation et la mise a jour des pheromones.
 
 % ====================================================
 % Q2
@@ -432,22 +434,27 @@ Le code final retient egalement :
   \item l'appel direct a \texttt{mark\_pheronome\_xy} pour simplifier legerement la mise a jour des pheromones.
 \end{itemize}
 
-\subsection{Tableau comparatif Q1 vs Q2}
+\subsection{Tableau comparatif Q1 vs Q2 dans le scope compute}
+
+La campagne finale Q2 a ete effectuee en mode headless, avec \texttt{T\_render = 0}. Une comparaison directe des temps totaux Q1/Q2 serait donc trompeuse, puisque Q1 archive encore le cout du rendu. La comparaison pertinente porte sur le sous-total compute :
+
+\[
+T_{\text{compute}} = T_{\text{move\_ants}} + T_{\text{evap}} + T_{\text{pher\_update}}.
+\]
 
 \begin{table}[H]
   \centering
   \small
-  \caption{Comparaison des moyennes Q1 / Q2 a partir des fichiers de \texttt{results/}.}
+  \caption{Comparaison Q1 / Q2 sur le perimetre compute a partir des fichiers de \texttt{results/}.}
   \label{tab:q1-q2-compare}
   \begin{tabular}{@{}lrrrr@{}}
     \toprule
     Metrique & Q1 (ms) & Q2 (ms) & Gain relatif & Facteur d'acceleration \\
     \midrule
-    \(T_{\text{move\_ants}}\) & 15253.78 & 6684.21 & -56.18 \% & 2.282x \\
-    \(T_{\text{evap}}\) & 1664.29 & 1532.42 & -7.92 \% & 1.086x \\
-    \(T_{\text{pher\_update}}\) & 38.92 & 38.40 & -1.35 \% & 1.014x \\
-    \(T_{\text{render}}\) & 67094.22 & 64683.76 & -3.59 \% & 1.037x \\
-    \(T_{\text{total}}\) & 84118.09 & 73000.54 & -13.22 \% & 1.152x \\
+    \(T_{\text{move\_ants}}\) & 15253.78 & 4611.60 & -69.77 \% & 3.308x \\
+    \(T_{\text{evap}}\) & 1664.29 & 1383.16 & -16.89 \% & 1.203x \\
+    \(T_{\text{pher\_update}}\) & 38.92 & 30.62 & -21.34 \% & 1.271x \\
+    \(T_{\text{compute}}\) & 16956.99 & 6025.37 & -64.47 \% & 2.814x \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -474,14 +481,236 @@ La Q2 montre une lecon importante en optimisation haute performance :
   \item dans ce projet, les gains decisifs proviennent surtout de la simplification du noyau chaud et de la specialisation du generateur pseudo-aleatoire.
 \end{itemize}
 
-Le resultat est toutefois net :
+Le resultat est toutefois net sur le scope compute :
 
 \begin{itemize}[leftmargin=1.2em]
-  \item le temps de deplacement des fourmis est reduit d'un facteur \(2.282\times\) ;
-  \item le temps total est reduit d'un facteur \(1.152\times\) ;
+  \item le temps de deplacement des fourmis est reduit d'un facteur \(3.308\times\) ;
+  \item le sous-total compute est reduit d'un facteur \(2.814\times\) ;
   \item la correction fonctionnelle est preservee.
 \end{itemize}
 
 Q2 constitue donc une etape techniquement reussie non pas parce qu'elle aurait force une vectorisation SIMD parfaite, mais parce qu'elle a permis de transformer un diagnostic de performance en optimisations concretes, mesurables et correctes.
+
+% ====================================================
+% Q3
+% ====================================================
+\section{Q3 : Parallelisation en Memoire Partagee (OpenMP)}
+
+\subsection{Strategie generale et protocole experimental}
+
+La Q3 reprend la version SoA de Q2 et introduit une parallelisation en memoire partagee a l'aide d'OpenMP. Deux cibles principales sont identifiees :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item l'evaporation des pheromones, qui constitue une boucle reguliere et naturellement parallelisable ;
+  \item le deplacement des fourmis, qui reste le noyau dominant mais pose des problemes d'ecritures concurrentes.
+\end{itemize}
+
+La campagne experimentale archivee dans \texttt{final\_results/} suit le meme protocole que les etapes precedentes :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item warm-up prealable non comptabilise ;
+  \item 5 repetitions mesurees par configuration ;
+  \item rendu SDL desactive via \texttt{--gui 0} ;
+  \item validation fonctionnelle par \texttt{Food\_KPI} et \texttt{Checksum}.
+\end{itemize}
+
+Les valeurs archivees confirment une reproductibilite stricte entre Q2 et Q3 :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{First\_Iteration = 1236}
+  \item \texttt{Food\_KPI = 4353}
+  \item \texttt{Checksum = 1479050492479337403}
+\end{itemize}
+
+L'absence de derive sur ces indicateurs montre que la parallelisation retenue ne modifie pas la logique sequentielle de reference et qu'aucune race condition observable n'est introduite dans la version finale.
+
+\subsection{Surmonter le goulet d'etranglement des verrous}
+
+Une premiere tentative naive consistait a proteger les structures partagees a l'aide de clauses \texttt{critical} et \texttt{atomic} directement dans le noyau de deplacement. Le schema etait conceptuellement du type :
+
+\begin{verbatim}
+#pragma omp parallel for
+for (...) {
+    ...
+    #pragma omp critical
+    phen.mark_pheronome_xy(...);
+
+    #pragma omp atomic update
+    ++cpteur_food;
+
+    #pragma omp atomic capture
+    index = nb_next_loaded++;
+}
+\end{verbatim}
+
+Cette approche garantissait bien la correction, mais elle s'est revelee defavorable en performance. La cause est structurelle : les fourmis se concentrent progressivement sur des chemins communs du paysage fractal. Les threads entrent alors en collision frequente sur les memes zones de pheromones, ce qui transforme la section critique en point de congestion global. Les operations atomiques sur les compteurs d'insertion des listes actives ajoutent une seconde source de contention.
+
+Au lieu de calculer en parallele, les threads passent alors une part importante du temps a attendre l'acces aux ressources partagees. Ce comportement est typique d'un code irregulier a forte contention, et explique pourquoi une protection trop fine peut rendre une version OpenMP plus lente qu'une implementation sequentielle soigneusement optimisee.
+
+La solution finale consiste donc a supprimer les verrous du chemin critique. Chaque thread accumule localement :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item les identifiants des fourmis qui restent actives pour le tour suivant ;
+  \item les positions a marquer dans la carte de pheromones ;
+  \item sa contribution locale au compteur de nourriture.
+\end{itemize}
+
+Une fusion sequentielle est ensuite realisee en fin de passe. Ce choix preserve la structure generale du scheduler par rondes de Q2, tout en deplacant la synchronisation hors de la boucle chaude.
+
+\subsection{Ordonnancement OpenMP retenu}
+
+La version finale du noyau de deplacement repose sur la structure suivante :
+
+\begin{verbatim}
+#pragma omp parallel if (nb_actives > 1024)
+{
+    #pragma omp for schedule(guided,64) nowait
+    for (...) {
+        ...
+    }
+}
+\end{verbatim}
+
+Le choix de \texttt{parallel if (nb\_actives > 1024)} est motive par le caractere iteratif du scheduler. En fin de ronde, le nombre de fourmis actives peut devenir faible. Dans ce cas, le cout de creation et de pilotage d'une equipe de threads peut depasser le travail utile. La garde conditionnelle permet donc de conserver une execution locale lorsque la granularite n'est plus suffisante.
+
+Le choix de \texttt{schedule(guided,64)} repond a l'irregularite du deplacement :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item certaines fourmis convergent vite ;
+  \item d'autres restent plus longtemps dans les boucles d'exploration ;
+  \item la repartition spatiale est fortement non uniforme.
+\end{itemize}
+
+Un ordonnancement statique penaliserait alors le \emph{load balancing}. L'ordonnancement guide attribue d'abord de gros blocs, puis reduit progressivement leur taille jusqu'a un minimum de 64 iterations. Ce compromis limite le cout du runtime tout en reequilibrant le travail en fin de boucle.
+
+L'option \texttt{nowait} supprime enfin la barriere implicite en fin de \texttt{omp for}. Dans un code a charge variable, cela permet de reduire les attentes inutiles entre threads avant la fusion finale.
+
+\subsection{Resultats et analyse quantitative}
+
+Le temps sequentiel de reference est pris dans \texttt{final\_results/Q2\_timings\_breakdown.csv} :
+
+\[
+T_s = 6026.461186\ \text{ms}
+\]
+
+Le speedup et l'efficacite sont definis par :
+
+\[
+S(p) = \frac{T_s}{T_p}
+\qquad\qquad
+E(p) = \frac{S(p)}{p}
+\]
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Synthese des performances Q3 a partir de \texttt{final\_results/Q3\_openmp\_scaling.csv}.}
+  \label{tab:q3-scaling}
+  \begin{tabular}{@{}rrrr@{}}
+    \toprule
+    Threads \(p\) & Temps moyen \(T_p\) (ms) & Speedup \(S(p)\) & Efficacite \(E(p)\) \\
+    \midrule
+    1 & 7349.997 & 0.820 & 0.820 \\
+    2 & 5664.447 & 1.064 & 0.532 \\
+    4 & 4878.286 & 1.235 & 0.309 \\
+    8 & 7591.974 & 0.794 & 0.099 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Le premier constat est l'existence d'un surcout a 1 thread : la version OpenMP est plus lente que Q2. Ce resultat est attendu et provient du runtime OpenMP lui-meme, ainsi que de la creation et de la reinitialisation des buffers locaux a chaque appel du noyau de deplacement. Cette surcharge est le prix a payer pour rendre le code parallelisable.
+
+En revanche, le passage a 2 puis 4 threads devient benefique. La meilleure configuration de la campagne est atteinte avec 4 threads :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \(T_4 = 4878.286\ \text{ms}\) ;
+  \item \(S(4) = 1.235\) par rapport a la reference sequentielle Q2 ;
+  \item gain global d'environ \(19\%\) par rapport a Q2.
+\end{itemize}
+
+Ce comportement est coherent avec la machine de test, qui dispose de 4 coeurs physiques. A cette echelle, l'evaporation et le deplacement des fourmis beneficient d'une mise en parallel efficace sans saturer totalement les ressources physiques.
+
+\subsection{Analyse des figures de scalabilite}
+
+Les graphiques generes a partir des fichiers de \texttt{final\_results/} sont inseres ci-dessous. Ils illustrent respectivement l'evolution du temps d'execution, du speedup et de l'efficacite.
+
+\begin{figure}[H]
+  \centering
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{../final_results/q3_time_vs_threads.png}
+    \caption*{Temps d'execution en fonction du nombre de threads.}
+  \end{minipage}
+  \hfill
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{../final_results/q3_speedup.png}
+    \caption*{Speedup mesure compare au speedup ideal.}
+  \end{minipage}
+
+  \vspace{0.8em}
+
+  \begin{minipage}{0.58\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{../final_results/q3_efficiency.png}
+    \caption*{Efficacite de parallelisation.}
+  \end{minipage}
+  \caption{Graphiques de scalabilite Q3 generes a partir des resultats finaux.}
+  \label{fig:q3-graphs}
+\end{figure}
+
+L'analyse scientifique de ces courbes fait apparaître trois regimes distincts.
+
+\subsubsection{Regime 1 thread : overhead pur}
+
+Le point \(p=1\) reste en dessous de la reference sequentielle Q2, avec \(S(1)=0.820\). Ce comportement traduit le cout fixe du runtime OpenMP, la gestion des buffers locaux et la logique de fusion introduite pour supprimer les verrous dans le noyau chaud. La parallelisation n'est donc rentable que lorsque la quantite de travail disponible suffit a amortir cette infrastructure supplementaire.
+
+\subsubsection{Regime utile : 2 a 4 threads}
+
+Entre 2 et 4 threads, le temps decroit effectivement et le speedup croît. On observe cependant un eloignement progressif par rapport a la droite ideale \(S(p)=p\). Cet ecart s'explique par plusieurs facteurs :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item une partie du code reste sequentielle, notamment la fusion finale des buffers locaux ;
+  \item l'ordonnancement OpenMP et la gestion des equipes de threads introduisent un overhead non nul ;
+  \item la charge reste irreguliere, meme avec \texttt{guided}, ce qui empeche un equilibre parfait.
+\end{itemize}
+
+Autrement dit, la Q3 valide un gain de performance reel, mais elle ne peut pas atteindre la courbe ideale en raison des contraintes structurelles du probleme.
+
+\subsubsection{Regime 8 threads : plafond materiel et Hyperthreading}
+
+La degradation a 8 threads est physiquement cohérente avec la machine de test. Celle-ci possede 4 coeurs physiques et 8 coeurs logiques. Le passage de 4 a 8 threads n'ajoute donc pas de nouvelles unites de calcul physiques ; il active essentiellement le SMT / Hyperthreading.
+
+Dans une charge deja intensive en calcul et en trafic memoire, les coeurs physiques saturent rapidement :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item les ALU et unites de calcul sont deja sollicitees ;
+  \item les caches L1/L2 sont fortement utilises ;
+  \item la bande passante memoire devient plus disputee.
+\end{itemize}
+
+Les threads logiques supplementaires n'apportent alors pas un debit additionnel significatif. Ils introduisent au contraire davantage de concurrence sur les memes ressources physiques, ce qui explique :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item la chute de l'efficacite a \(E(8) \approx 0.099\) ;
+  \item l'augmentation de la variabilite experimentale ;
+  \item la perte de performance globale par rapport a 4 threads.
+\end{itemize}
+
+\subsection{Conclusion Q3}
+
+La Q3 montre qu'une parallelisation OpenMP reussie ne repose pas seulement sur l'ajout de pragmas, mais sur une maitrise de la contention et de la granularite du travail.
+
+Les conclusions principales sont les suivantes :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item l'approche naive par \texttt{critical} et \texttt{atomic} dans le noyau chaud est defavorable ;
+  \item la strategie a buffers locaux elimine le goulet d'etranglement des verrous tout en conservant la structure generale du code Q2 ;
+  \item l'ordonnancement \texttt{guided} et la garde \texttt{if (nb\_actives > 1024)} permettent de contenir l'overhead du runtime ;
+  \item le meilleur compromis experimental est obtenu a 4 threads, correspondant au nombre de coeurs physiques ;
+  \item 8 threads mettent en evidence la limite de l'Hyperthreading pour ce type de charge compute-bound et memory-bound.
+\end{itemize}
+
+En synthese, la Q3 valide un gain mesurable par parallelisation en memoire partagee, avec une acceleration maximale d'environ \(1.235\times\) par rapport a Q2. Le resultat reste loin du speedup ideal, mais il est scientifiquement coherent avec la loi d'Amdahl, avec l'irregularite du noyau de deplacement, et avec les limites materielles de la plateforme.
 
 \end{document}

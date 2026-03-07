@@ -3,3 +3,7 @@ report/*
 !report/*.pdf
 !report/*.tex
 !report/imgs
+scripts/*
+results/*
+
+.venv/

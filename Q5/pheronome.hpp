@@ -29,14 +29,14 @@ public:
      * @param alpha Paramètre de bruit
      * @param beta Paramêtre d'évaporation
      */
-    pheronome( size_t dim, const position_t& pos_food, const position_t& pos_nest,
-               double alpha = 0.7, double beta = 0.9999, int rank, int size )
+    pheronome(std::size_t dim, const position_t& pos_food, const position_t& pos_nest, 
+              int rank, int size, double alpha = 0.7, double beta = 0.9999)
         : m_dim(dim), m_stride(dim + 2), m_alpha(alpha), m_beta(beta),
           m_pos_nest(pos_nest), m_pos_food(pos_food)
-          {
-        size_t rows_per_proc = dim / size;
-        size_t remainder = dim % size;
-        m_row_start = rank * rows_per_proc + std::min((size_t)rank, remainder);
+    {
+        size_t rows_per_proc = dim / (size_t)size;
+        size_t remainder = dim % (size_t)size;
+        m_row_start = (size_t)rank * rows_per_proc + std::min((size_t)rank, remainder);
         m_local_height = rows_per_proc + ((size_t)rank < remainder ? 1 : 0);
 
         m_map_of_pheronome.assign(m_stride * (m_local_height + 2), {{0., 0.}});

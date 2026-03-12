@@ -57,6 +57,16 @@ void AntSwarm::initialiser_positions_aleatoires(const fractal_land& land, std::s
 void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
                            const position_t& pos_food, const position_t& pos_nest, std::size_t& cpteur_food)
 {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    std::vector<AntData> send_up;
+    std::vector<AntData> send_down;
+    std::vector<AntData> recv_up;
+    std::vector<AntData> recv_down;
+    std::vector<char> is_sent(m_x.size(), 0);
+
     // Debut d'une iteration globale: toutes les fourmis ont un budget de deplacement nul consomme.
     std::fill(consumed_time.begin(), consumed_time.end(), 0.0);
 
@@ -103,6 +113,8 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
                              std::size_t& nb_next_unloaded)
     {
         for (int t = 0; t < nb_threads; ++t) {
+            send_up_local[t].clear();
+            send_down_local[t].clear();
             next_loaded_local[static_cast<std::size_t>(t)].clear();
             next_unloaded_local[static_cast<std::size_t>(t)].clear();
             marks_local[static_cast<std::size_t>(t)].clear();
@@ -111,10 +123,10 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
 
         #pragma omp parallel if (nb_actives > 1024)
         {
+            const int tid = omp_get_thread_num();
             #pragma omp for schedule(guided,64) nowait
             for (std::int64_t pos = 0; pos < static_cast<std::int64_t>(nb_actives); ++pos) {
                 const std::uint32_t i = liste_active[static_cast<std::size_t>(pos)];
-                const int tid = omp_get_thread_num();
 
                 double choix = rand_choice_01(m_seed[i]);
                 position_t old_pos_ant{m_x[i], m_y[i]};
@@ -125,10 +137,12 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
                 const position_t pos_haut{new_pos_ant.x, new_pos_ant.y - 1};
                 const position_t pos_bas{new_pos_ant.x, new_pos_ant.y + 1};
 
-                double max_phen = std::max({phen[pos_gauche][ind_pher],
-                                            phen[pos_droite][ind_pher],
-                                            phen[pos_haut][ind_pher],
-                                            phen[pos_bas][ind_pher]});
+                double max_phen = std::max({
+                    phen(pos_gauche.x, pos_gauche.y)[ind_pher],
+                    phen(pos_droite.x, pos_droite.y)[ind_pher],
+                    phen(pos_haut.x, pos_haut.y)[ind_pher],
+                    phen(pos_bas.x, pos_bas.y)[ind_pher]
+                });
 
                 if ((choix > m_eps) || (max_phen <= 0.0)) {
                     do {
@@ -140,13 +154,13 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
                         if (d == 3) new_pos_ant.x += 1;
                         if (d == 4) new_pos_ant.y += 1;
 
-                    } while (phen[new_pos_ant][ind_pher] == -1.0);
+                    } while (phen(new_pos_ant.x, new_pos_ant.y)[ind_pher] == -1.0);
                 } else {
-                    if (phen[pos_gauche][ind_pher] == max_phen)
+                    if (phen(pos_gauche.x, pos_gauche.y)[ind_pher] == max_phen)
                         new_pos_ant.x -= 1;
-                    else if (phen[pos_droite][ind_pher] == max_phen)
+                    else if (phen(pos_droite.x, pos_droite.y)[ind_pher] == max_phen)
                         new_pos_ant.x += 1;
-                    else if (phen[pos_haut][ind_pher] == max_phen)
+                    else if (phen(pos_haut.x, pos_haut.y)[ind_pher] == max_phen)
                         new_pos_ant.y -= 1;
                     else
                         new_pos_ant.y += 1;
@@ -218,16 +232,6 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
         }
     };
 
-    std::vector<AntData> send_up;
-    std::vector<AntData> send_down;
-    std::vector<AntData> recv_up;
-    std::vector<AntData> recv_down;
-    std::vector<char> is_sent(m_x.size(), 0);
-
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
     MPI_Datatype MPI_AntData;
     {
         AntData dummy;
@@ -240,7 +244,7 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
         MPI_Get_address(&dummy.seed, &displs[3]);
         for (int i = 0; i < 4; ++i) displs[i] -= base;
         int blocklens[4] = {1, 1, 1, 1};
-        MPI_Datatype types[4] = {MPI_INT, MPI_INT, MPI_INT, MPI_UNSIGNED};
+        MPI_Datatype types[4] = {MPI_INT, MPI_INT, MPI_INT, MPI_UINT32_T};
         MPI_Type_create_struct(4, blocklens, displs, types, &MPI_AntData);
         MPI_Type_commit(&MPI_AntData);
     }

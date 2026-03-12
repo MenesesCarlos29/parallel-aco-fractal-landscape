@@ -161,29 +161,36 @@ Config parse_args(int argc, char* argv[]) {
 }
 
 void normaliser_terrain(fractal_land& land) {
-    double max_val = std::numeric_limits<double>::lowest();
-    double min_val = std::numeric_limits<double>::max();
+    double local_max = std::numeric_limits<double>::lowest();
+    double local_min = std::numeric_limits<double>::max();
 
-    for (fractal_land::dim_t i = 0; i < land.dimensions(); ++i) {
-        for (fractal_land::dim_t j = 0; j < land.dimensions(); ++j) {
-            max_val = std::max(max_val, land(i, j));
-            min_val = std::min(min_val, land(i, j));
+    for (unsigned long j = 0; j < land.local_height(); ++j) {
+        unsigned long j_global = j + land.row_start();
+        for (unsigned long i = 0; i < land.dimensions(); ++i) {
+            local_max = std::max(local_max, land(i, j_global));
+            local_min = std::min(local_min, land(i, j_global));
         }
     }
 
-    const double delta = max_val - min_val;
+    double global_max, global_min;
+    MPI_Allreduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_min, &global_min, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+
+    const double delta = global_max - global_min;
     if (delta <= std::numeric_limits<double>::epsilon()) {
-        for (fractal_land::dim_t i = 0; i < land.dimensions(); ++i) {
-            for (fractal_land::dim_t j = 0; j < land.dimensions(); ++j) {
-                land(i, j) = 0.0;
+        for (unsigned long j = 0; j < land.local_height(); ++j) {
+            unsigned long j_global = j + land.row_start();
+            for (unsigned long i = 0; i < land.dimensions(); ++i) {
+                land(i, j_global) = 0.0;
             }
         }
         return;
     }
 
-    for (fractal_land::dim_t i = 0; i < land.dimensions(); ++i) {
-        for (fractal_land::dim_t j = 0; j < land.dimensions(); ++j) {
-            land(i, j) = (land(i, j) - min_val) / delta;
+    for (unsigned long j = 0; j < land.local_height(); ++j) {
+        unsigned long j_global = j + land.row_start();
+        for (unsigned long i = 0; i < land.dimensions(); ++i) {
+            land(i, j_global) = (land(i, j_global) - global_min) / delta;
         }
     }
 }
@@ -397,7 +404,9 @@ MesuresRepetition executer_repetition(const Config& cfg,
         params_fractal.log2_sous_grille,
         params_fractal.nb_graines,
         1.0,
-        static_cast<int>(current_seed & 0x7fffffffU)
+        static_cast<int>(current_seed & 0x7fffffffU),
+        rank,
+        size
     );
     normaliser_terrain(land);
 

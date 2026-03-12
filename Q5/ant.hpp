@@ -50,4 +50,10 @@ private:
     std::vector<std::uint32_t> next_unloaded_ids;
 };
 
+struct AntData {
+    int x, y, is_loaded;
+    std::uint32_t seed;
+};
+
+
 #endif

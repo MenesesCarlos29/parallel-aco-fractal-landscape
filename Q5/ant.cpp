@@ -1,6 +1,7 @@
 #include "ant.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <mpi.h>
 #include <omp.h>
 #include "rand_generator.hpp"
 
@@ -72,10 +73,16 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
     }
 
     // Buffers locaux OpenMP
+    active_loaded_ids.resize(m_x.size() * 2 + 16);
+    active_unloaded_ids.resize(m_x.size() * 2 + 16);
+    next_loaded_ids.resize(m_x.size() * 2 + 16);
+    next_unloaded_ids.resize(m_x.size() * 2 + 16);
     const int nb_threads = omp_get_max_threads();
     std::vector<std::vector<std::uint32_t>> next_loaded_local(static_cast<std::size_t>(nb_threads));
     std::vector<std::vector<std::uint32_t>> next_unloaded_local(static_cast<std::size_t>(nb_threads));
     std::vector<std::vector<position_t>> marks_local(static_cast<std::size_t>(nb_threads));
+    std::vector<std::vector<AntData>> send_up_local(static_cast<std::size_t>(nb_threads));
+    std::vector<std::vector<AntData>> send_down_local(static_cast<std::size_t>(nb_threads));
     std::vector<std::size_t> food_local(static_cast<std::size_t>(nb_threads), 0);
     const std::size_t reserve_par_thread =
         (m_x.size() / static_cast<std::size_t>(nb_threads)) + 64;
@@ -83,6 +90,8 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
         next_loaded_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
         next_unloaded_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
         marks_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
+        send_up_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
+        send_down_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
     }
 
     auto traiter_liste = [&](std::vector<std::uint32_t>& liste_active,
@@ -145,6 +154,18 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
 
                 m_x[i] = new_pos_ant.x;
                 m_y[i] = new_pos_ant.y;
+
+                if (!phen.is_local(static_cast<std::size_t>(new_pos_ant.y))) {
+                    AntData d{new_pos_ant.x, new_pos_ant.y, static_cast<int>(m_is_loaded[i]), m_seed[i]};
+                    is_sent[i] = 1;
+                    if (new_pos_ant.y < old_pos_ant.y) {
+                        send_up_local[static_cast<std::size_t>(tid)].push_back(d);
+                    } else {
+                        send_down_local[static_cast<std::size_t>(tid)].push_back(d);
+                    }
+                    continue;
+                }
+
                 marks_local[static_cast<std::size_t>(tid)].push_back(new_pos_ant);
 
                 if (new_pos_ant == pos_nest) {
@@ -175,6 +196,13 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
         for (int t = 0; t < nb_threads; ++t) {
             cpteur_food += food_local[static_cast<std::size_t>(t)];
 
+            for (const AntData& d : send_up_local[static_cast<std::size_t>(t)]) {
+                send_up.push_back(d);
+            }
+            for (const AntData& d : send_down_local[static_cast<std::size_t>(t)]) {
+                send_down.push_back(d);
+            }
+
             for (const position_t& pos : marks_local[static_cast<std::size_t>(t)]) {
                 phen.mark_pheronome_xy(static_cast<std::size_t>(pos.x),
                                        static_cast<std::size_t>(pos.y));
@@ -190,8 +218,40 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
         }
     };
 
-    // Ordonnancement par rondes: chaque fourmi active effectue un micro-deplacement par tour.
+    std::vector<AntData> send_up;
+    std::vector<AntData> send_down;
+    std::vector<AntData> recv_up;
+    std::vector<AntData> recv_down;
+    std::vector<char> is_sent(m_x.size(), 0);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    MPI_Datatype MPI_AntData;
+    {
+        AntData dummy;
+        MPI_Aint base;
+        MPI_Get_address(&dummy, &base);
+        MPI_Aint displs[4];
+        MPI_Get_address(&dummy.x, &displs[0]);
+        MPI_Get_address(&dummy.y, &displs[1]);
+        MPI_Get_address(&dummy.is_loaded, &displs[2]);
+        MPI_Get_address(&dummy.seed, &displs[3]);
+        for (int i = 0; i < 4; ++i) displs[i] -= base;
+        int blocklens[4] = {1, 1, 1, 1};
+        MPI_Datatype types[4] = {MPI_INT, MPI_INT, MPI_INT, MPI_UNSIGNED};
+        MPI_Type_create_struct(4, blocklens, displs, types, &MPI_AntData);
+        MPI_Type_commit(&MPI_AntData);
+    }
+
+    int up = (rank == 0) ? MPI_PROC_NULL : rank - 1;
+    int down = (rank == size - 1) ? MPI_PROC_NULL : rank + 1;
+
     while ((active_loaded_count + active_unloaded_count) != 0) {
+        send_up.clear();
+        send_down.clear();
+
         std::size_t next_loaded_count = 0;
         std::size_t next_unloaded_count = 0;
 
@@ -211,10 +271,80 @@ void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
                       next_unloaded_ids,
                       next_unloaded_count);
 
+        int send_up_count = static_cast<int>(send_up.size());
+        int send_down_count = static_cast<int>(send_down.size());
+        int recv_up_count = 0;
+        int recv_down_count = 0;
+
+        MPI_Sendrecv(&send_up_count, 1, MPI_INT, up, 10,
+                     &recv_down_count, 1, MPI_INT, down, 10,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        MPI_Sendrecv(&send_down_count, 1, MPI_INT, down, 11,
+                     &recv_up_count, 1, MPI_INT, up, 11,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        recv_up.resize(static_cast<std::size_t>(recv_up_count));
+        recv_down.resize(static_cast<std::size_t>(recv_down_count));
+
+        MPI_Sendrecv(send_up.data(), send_up_count, MPI_AntData, up, 20,
+                     recv_down.data(), recv_down_count, MPI_AntData, down, 20,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        MPI_Sendrecv(send_down.data(), send_down_count, MPI_AntData, down, 21,
+                     recv_up.data(), recv_up_count, MPI_AntData, up, 21,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        auto add_received = [&](const AntData &ant) {
+            m_x.push_back(ant.x);
+            m_y.push_back(ant.y);
+            m_is_loaded.push_back(static_cast<std::uint8_t>(ant.is_loaded));
+            m_seed.push_back(ant.seed);
+            consumed_time.push_back(0.0);
+            is_sent.push_back(0);
+            std::uint32_t new_index = static_cast<std::uint32_t>(m_x.size() - 1);
+            if (ant.is_loaded != 0) {
+                if (next_loaded_ids.size() <= next_loaded_count) next_loaded_ids.resize(next_loaded_count + 1);
+                next_loaded_ids[next_loaded_count++] = new_index;
+            } else {
+                if (next_unloaded_ids.size() <= next_unloaded_count) next_unloaded_ids.resize(next_unloaded_count + 1);
+                next_unloaded_ids[next_unloaded_count++] = new_index;
+            }
+        };
+
+        for (const AntData &ant : recv_up) add_received(ant);
+        for (const AntData &ant : recv_down) add_received(ant);
+
         std::swap(active_loaded_ids, next_loaded_ids);
         std::swap(active_unloaded_ids, next_unloaded_ids);
 
         active_loaded_count = next_loaded_count;
         active_unloaded_count = next_unloaded_count;
     }
+
+    std::size_t compact_write = 0;
+    for (std::size_t read = 0, total = m_x.size(); read < total; ++read) {
+        if (is_sent[read]) continue;
+        if (compact_write != read) {
+            m_x[compact_write] = m_x[read];
+            m_y[compact_write] = m_y[read];
+            m_is_loaded[compact_write] = m_is_loaded[read];
+            m_seed[compact_write] = m_seed[read];
+            consumed_time[compact_write] = consumed_time[read];
+        }
+        ++compact_write;
+    }
+
+    m_x.resize(compact_write);
+    m_y.resize(compact_write);
+    m_is_loaded.resize(compact_write);
+    m_seed.resize(compact_write);
+    consumed_time.resize(compact_write);
+    is_sent.resize(compact_write);
+
+    std::size_t global_food = 0;
+    MPI_Allreduce(&cpteur_food, &global_food, 1, MPI_UNSIGNED_LONG, MPI_SUM, MPI_COMM_WORLD);
+    cpteur_food = global_food;
+
+    MPI_Type_free(&MPI_AntData);
 }

@@ -1,10 +1,11 @@
-
 report/*
 !report/*.pdf
-!report/*.tex
-!report/imgs
+!report/imgs/
+!report/README.md
 scripts/*
+!scripts/README.md
 results/*
+!results/README.md
 
 .venv/
 .vscode/

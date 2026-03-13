@@ -161,38 +161,29 @@ Config parse_args(int argc, char* argv[]) {
 }
 
 void normaliser_terrain(fractal_land& land) {
-    double local_max = std::numeric_limits<double>::lowest();
-    double local_min = std::numeric_limits<double>::max();
+    double max_val = std::numeric_limits<double>::lowest();
+    double min_val = std::numeric_limits<double>::max();
 
-    for (unsigned long j = 0; j < land.local_height(); ++j) {
-        unsigned long j_global = j + land.row_start();
-        for (unsigned long i = 0; i < land.dimensions(); ++i) {
-            local_max = std::max(local_max, land(i, j_global));
-            local_min = std::min(local_min, land(i, j_global));
+    for (fractal_land::dim_t i = 0; i < land.dimensions(); ++i) {
+        for (fractal_land::dim_t j = 0; j < land.dimensions(); ++j) {
+            max_val = std::max(max_val, land(i, j));
+            min_val = std::min(min_val, land(i, j));
         }
     }
 
-    double global_max, global_min;
-    MPI_Allreduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    MPI_Allreduce(&local_min, &global_min, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
-
-    const double delta = global_max - global_min;
-    const double terrain_floor = 0.20;
+    const double delta = max_val - min_val;
     if (delta <= std::numeric_limits<double>::epsilon()) {
-        for (unsigned long j = 0; j < land.local_height(); ++j) {
-            unsigned long j_global = j + land.row_start();
-            for (unsigned long i = 0; i < land.dimensions(); ++i) {
-                land(i, j_global) = terrain_floor;
+        for (fractal_land::dim_t i = 0; i < land.dimensions(); ++i) {
+            for (fractal_land::dim_t j = 0; j < land.dimensions(); ++j) {
+                land(i, j) = 0.0;
             }
         }
         return;
     }
 
-    for (unsigned long j = 0; j < land.local_height(); ++j) {
-        unsigned long j_global = j + land.row_start();
-        for (unsigned long i = 0; i < land.dimensions(); ++i) {
-            double normalized = (land(i, j_global) - global_min) / delta;
-            land(i, j_global) = terrain_floor + (1.0 - terrain_floor) * normalized;
+    for (fractal_land::dim_t i = 0; i < land.dimensions(); ++i) {
+        for (fractal_land::dim_t j = 0; j < land.dimensions(); ++j) {
+            land(i, j) = (land(i, j) - min_val) / delta;
         }
     }
 }
@@ -207,27 +198,30 @@ void melanger_checksum(std::uint64_t& checksum, std::uint64_t valeur) {
     checksum ^= valeur + 0x9e3779b97f4a7c15ULL + (checksum << 6U) + (checksum >> 2U);
 }
 
-std::uint64_t calculer_checksum(const pheronome& phen, const AntSwarm& ants) {
-    std::uint64_t checksum = 1469598103934665603ULL;
+std::uint64_t calculer_checksum(const pheronome& phen, const AntSwarm& ants, int rank, int size) {
+    std::uint64_t local_checksum = (rank == 0) ? 1469598103934665603ULL : 0ULL;
     const std::size_t dim = phen.dimensions();
-    const std::size_t start_row = phen.row_start();
-    const std::size_t stop_row = start_row + phen.local_height();
 
-    for (std::size_t j_global = start_row; j_global < stop_row; ++j_global) {
+    if (rank == 0) {
         for (std::size_t i = 0; i < dim; ++i) {
-            const auto& cellule = phen(i, j_global);
-            melanger_checksum(checksum, bits_double(cellule[0]));
-            melanger_checksum(checksum, bits_double(cellule[1]));
+            for (std::size_t j = 0; j < dim; ++j) {
+                const auto& cellule = phen(i, j);
+                melanger_checksum(local_checksum, bits_double(cellule[0]));
+                melanger_checksum(local_checksum, bits_double(cellule[1]));
+            }
         }
     }
 
     for (std::size_t i = 0; i < ants.size(); ++i) {
-        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(ants.x_at(i))));
-        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(ants.y_at(i))));
-        melanger_checksum(checksum, ants.is_loaded_at(i) ? 0xA5A5A5A5ULL : 0x5A5A5A5AULL);
+        melanger_checksum(local_checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(ants.x_at(i))));
+        melanger_checksum(local_checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(ants.y_at(i))));
+        melanger_checksum(local_checksum, ants.is_loaded_at(i) ? 0xA5A5A5A5ULL : 0x5A5A5A5AULL);
     }
 
-    return checksum;
+    std::uint64_t global_checksum = 0;
+    MPI_Reduce(&local_checksum, &global_checksum, 1, MPI_UINT64_T, MPI_BXOR, 0, MPI_COMM_WORLD);
+
+    return (rank == 0) ? global_checksum : 0;
 }
 
 struct ReferenceBaseline {
@@ -304,8 +298,11 @@ ReferenceBaseline charger_reference_baseline(const std::filesystem::path& chemin
 }
 
 void afficher_verification_reproductibilite_openmp(const std::vector<std::size_t>& food_kpi_q3,
-                                                   const std::vector<std::uint64_t>& checksums_q3) {
-    const auto reference = charger_reference_baseline("../results/Q3_threads1_reference.csv");
+                                                   const std::vector<std::uint64_t>& checksums_q3, int rank) {
+    
+    if (rank != 0) {
+        return;
+    }                                               const auto reference = charger_reference_baseline("../results/Q3_threads1_reference.csv");
     const int nb_threads = omp_get_max_threads();
 
     if (!reference.disponible) {
@@ -408,9 +405,7 @@ MesuresRepetition executer_repetition(const Config& cfg,
         params_fractal.log2_sous_grille,
         params_fractal.nb_graines,
         1.0,
-        static_cast<int>(current_seed & 0x7fffffffU),
-        rank,
-        size
+        static_cast<int>(current_seed & 0x7fffffffU)
     );
     normaliser_terrain(land);
 
@@ -427,14 +422,10 @@ MesuresRepetition executer_repetition(const Config& cfg,
         pos_food.x = std::min(pos_food.x + 1, borne_max);
     }
 
-    if (size <= 0) {
-        throw std::runtime_error("MPI_Comm_size returned zero or negative size");
-    }
+    std::size_t ants_per_proc = cfg.nb_ants / size;
+    std::size_t start_ant = rank * ants_per_proc;  
 
-    std::size_t ants_per_proc = cfg.nb_ants / static_cast<std::size_t>(size);
-    std::size_t remainder_ants = cfg.nb_ants % static_cast<std::size_t>(size);
-    std::size_t start_ant = static_cast<std::size_t>(rank) * ants_per_proc + std::min<std::size_t>(static_cast<std::size_t>(rank), remainder_ants);
-    std::size_t end_ant = start_ant + ants_per_proc + (static_cast<std::size_t>(rank) < remainder_ants ? 1 : 0);
+    std::size_t end_ant = (rank == size - 1) ? cfg.nb_ants : start_ant + ants_per_proc;
     std::size_t my_nb_ants = end_ant - start_ant;
 
     AntSwarm::set_exploration_coef(cfg.eps);
@@ -442,7 +433,14 @@ MesuresRepetition executer_repetition(const Config& cfg,
     std::size_t my_seed = current_seed + rank;
     ants.initialiser_positions_aleatoires(land, my_seed);
 
-    pheronome phen(land.dimensions(), pos_food, pos_nest, rank, size, cfg.alpha, cfg.beta);
+    int dim = (int)land.dimensions();
+    int rows_per_proc = dim / size;
+    int r_start = rank * rows_per_proc;
+    int r_end = (rank == size - 1) ? dim : r_start + rows_per_proc;
+
+    land.set_local_range(r_start, r_end - r_start);
+
+    pheronome phen(land.dimensions(), pos_food, pos_nest, cfg.alpha, cfg.beta);
 
     std::unique_ptr<Window> win;
     std::unique_ptr<Renderer> renderer;
@@ -465,10 +463,6 @@ MesuresRepetition executer_repetition(const Config& cfg,
     while (cont_loop && it < cfg.max_iters) {
         ++it;
 
-        if (rank == 0 && (it == 1 || it % 10 == 0)) {
-            std::cout << "[rank " << rank << "] iteration " << it << " / " << cfg.max_iters << "\n";
-        }
-
         if (activer_gui) {
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
@@ -478,22 +472,14 @@ MesuresRepetition executer_repetition(const Config& cfg,
             }
         }
 
-        // Propager stop_signal à tous les rangs pour s'assurer que le processus 0
-        // peut arrêter la simulation des autres s'il ferme la fenêtre GUI.
-        MPI_Bcast(&cont_loop, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
-        if (!cont_loop) {
-            break;
-        }
-
         const auto debut_move = horloge::now();
 
         std::size_t batch_food = 0;
 
-        ants.advance_one(phen, land, pos_food, pos_nest, batch_food);
+        ants.advance_one(phen, land, pos_food, pos_nest, batch_food, rank, size);
        
         unsigned long local_food = static_cast<unsigned long>(batch_food);
         unsigned long global_food = 0;
-       
         MPI_Allreduce(&local_food, &global_food, 1, MPI_UNSIGNED_LONG, MPI_SUM, MPI_COMM_WORLD);
 
         food_quantity += global_food;
@@ -503,29 +489,19 @@ MesuresRepetition executer_repetition(const Config& cfg,
         mesures.t_move_ants_ms += std::chrono::duration<double, std::milli>(fin_move - debut_move).count();
 
         const auto debut_evap = horloge::now();
-        if (rank == 0) {
-            phen.do_evaporation();
-        }
+        phen.do_evaporation();
         const auto fin_evap = horloge::now();
         mesures.t_evap_ms += std::chrono::duration<double, std::milli>(fin_evap - debut_evap).count();
 
         const auto debut_update = horloge::now();
         phen.update();
 
-        // MPI_Allreduce for pheromone data requires the same count on all ranks.
-        // Garantir cette condition même si local_height varie à cause de m_dimensions % size.
-        int local_count = static_cast<int>((phen.local_height() + 2) * phen.stride() * 2);
-        int max_count;
-        MPI_Allreduce(&local_count, &max_count, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-
-        std::vector<double> local_pher(max_count, 0.0);
-        std::vector<double> global_pher(max_count, 0.0);
-
-        std::memcpy(local_pher.data(), phen.data(), static_cast<size_t>(local_count) * sizeof(double));
-        MPI_Allreduce(local_pher.data(), global_pher.data(), max_count, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-        std::memcpy(phen.data(), global_pher.data(), static_cast<size_t>(local_count) * sizeof(double));
-
-        phen.update_halos(rank, size);
+        MPI_Allreduce(MPI_IN_PLACE,
+              phen.data(),
+              phen.stride() * phen.stride() * 2,
+              MPI_DOUBLE,
+              MPI_MAX,
+              MPI_COMM_WORLD);
 
         const auto fin_update = horloge::now();
         mesures.t_pher_update_ms +=
@@ -550,7 +526,7 @@ MesuresRepetition executer_repetition(const Config& cfg,
     mesures.t_total_ms = std::chrono::duration<double, std::milli>(fin_total - debut_total).count();
     mesures.food_kpi = food_quantity;
     mesures.iterations_executees = it;
-    mesures.checksum = calculer_checksum(phen, ants);
+    mesures.checksum = calculer_checksum(phen, ants, rank, size);
 
     return mesures;
 }
@@ -579,16 +555,6 @@ int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    if (size <= 0) size = 1;
-
-    int total_rows = 513;
-    int rows_per_proc = total_rows / size;
-    int remainder = total_rows % size;  
-
-    int my_row_start = rank * rows_per_proc + std::min(rank, remainder);
-    int my_row_end = my_row_start + rows_per_proc + (rank < remainder ? 1 : 0);
-    int my_height = my_row_end - my_row_start;
 
     try {
         Config cfg = parse_args(argc, argv);
@@ -648,9 +614,6 @@ int main(int argc, char* argv[]) {
         for (int rep = 0; rep < cfg.repetitions; ++rep) {
             const MesuresRepetition mesures = executer_repetition(cfg, params_fractal, cfg.gui, rank, size);
 
-            unsigned long long global_sum_checksum = 0;
-            MPI_Reduce(&mesures.checksum, &global_sum_checksum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-
             if (rank == 0) {
                 t_move_ants.push_back(mesures.t_move_ants_ms);
                 t_evap.push_back(mesures.t_evap_ms);
@@ -659,18 +622,13 @@ int main(int argc, char* argv[]) {
                 t_total.push_back(mesures.t_total_ms);
                 premiere_iteration_nourriture.push_back(mesures.premiere_iteration_nourriture);
                 food_kpi.push_back(mesures.food_kpi);
-                checksums.push_back(global_sum_checksum);
+                checksums.push_back(mesures.checksum);
 
                 std::cout << "Rep " << (rep + 1) << "/" << cfg.repetitions
-                        << " | T_move_ants=" << std::fixed << std::setprecision(6) << mesures.t_move_ants_ms << " ms"
-                        << " | T_evap=" << mesures.t_evap_ms << " ms"
-                        << " | T_pher_update=" << mesures.t_pher_update_ms << " ms"
-                        << " | T_render=" << mesures.t_render_ms << " ms"
-                        << " | T_total=" << mesures.t_total_ms << " ms"
-                        << " | First_Iteration=" << mesures.premiere_iteration_nourriture
-                        << " | Food_KPI=" << mesures.food_kpi
-                        << " | Global_Checksum=" << global_sum_checksum
-                        << "\n";
+                      << " | T_total=" << std::fixed << std::setprecision(2) << mesures.t_total_ms << " ms"
+                      << " | Food_KPI=" << mesures.food_kpi
+                      << " | Global_Checksum=" << mesures.checksum 
+                      << "\n";
 
                 afficher_sanity_check(mesures, cfg.gui);
             }
@@ -682,9 +640,10 @@ int main(int argc, char* argv[]) {
 
         if (rank == 0) {
             std::filesystem::create_directories("results");
-            std::ofstream csv_file("results/Q4_timings_breakdown.csv");
+            std::ofstream csv_file("results/Q5_timings_breakdown.csv");
+            afficher_verification_reproductibilite_openmp(food_kpi, checksums);
             if (!csv_file.is_open()) {
-                std::cerr << "Erreur: impossible d'ecrire results/Q4_timings_breakdown.csv\n";
+                std::cerr << "Erreur: impossible d'ecrire results/Q5_timings_breakdown.csv\n";
                 return 1;
             }
 
@@ -728,7 +687,7 @@ int main(int argc, char* argv[]) {
                     << std_render << ","
                     << std_total << "\n";
 
-            std::cout << "\n=== Resultats Q4 (timings par etape) ===\n";
+            std::cout << "\n=== Resultats Q5 (timings par etape) ===\n";
             std::cout << "Moyennes (ms):"
                     << " move_ants=" << mean_move
                     << " | evap=" << mean_evap
@@ -736,10 +695,11 @@ int main(int argc, char* argv[]) {
                     << " | render=" << mean_render
                     << " | total=" << mean_total << "\n";
 
-            std::cout << "CSV local genere: results/Q4_timings_breakdown.csv\n";
+            std::cout << "CSV local genere: results/Q5_timings_breakdown.csv\n";
             afficher_verification_reproductibilite_openmp(food_kpi, checksums);
         }
 
+        MPI_Barrier(MPI_COMM_WORLD);
         MPI_Finalize();
         return 0;
     } catch (const std::exception& e) {
@@ -747,7 +707,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "Erreur: " << e.what() << "\n";
             afficher_aide(argv[0]);
         }
-        MPI_Abort(MPI_COMM_WORLD, 1); // <--- Esto mata a todos los ranks si uno falla
+        MPI_Abort(MPI_COMM_WORLD, 1); 
         return 1;
     }
 }

@@ -1,4 +1,4 @@
-CC = gcc -fopenmp
-CXX = g++ -fopenmp
-MPICXX = mpic++ -fopenmp
+CC = gcc
+CXX = g++
+MPICXX = mpic++
 LIB = -lpthread -lSDL2

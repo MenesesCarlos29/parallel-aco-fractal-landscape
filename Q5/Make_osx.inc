@@ -1,3 +1,3 @@
-CC = g++-10 -fopenmp
-CXX = g++-10 -fopenmp
+CC = g++-10
+CXX = g++-10
 LIB = -lpthread

@@ -1,411 +1,320 @@
 #include "ant.hpp"
+
 #include <algorithm>
-#include <cstdint>
+#include <array>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
 #include <mpi.h>
-#include <omp.h>
+
 #include "rand_generator.hpp"
 
-double AntSwarm::m_eps = 0.;
+double AntSwarm::m_eps = 0.0;
 
-AntSwarm::AntSwarm(std::size_t nb_ants)
-{
-    if (nb_ants > 0) {
-            resize(nb_ants);
-        }
-}
+namespace {
 
-void AntSwarm::resize(std::size_t nb_ants)
-{
-    m_x.assign(nb_ants, 0);
-    m_y.assign(nb_ants, 0);
-    m_is_loaded.assign(nb_ants, 0);
-    m_seed.assign(nb_ants, 0);
-    consumed_time.resize(nb_ants);
-    active_loaded_ids.resize(nb_ants);
-    active_unloaded_ids.resize(nb_ants);
-    next_loaded_ids.resize(nb_ants);
-    next_unloaded_ids.resize(nb_ants);
-}
-static inline std::uint32_t next_seed(std::uint32_t& seed)
-{
-    seed = static_cast<std::uint32_t>((1664525ull * seed + 1013904223ull) % 0xFFFFFFFFu);
+static inline std::uint32_t next_seed(std::uint32_t& seed) {
+    seed = static_cast<std::uint32_t>((1664525ULL * seed + 1013904223ULL) % 0xFFFFFFFFU);
     return seed;
 }
 
-static inline double rand_choice_01(std::uint32_t& seed)
-{
-    return static_cast<double>(next_seed(seed) % 2u);
+static inline double rand_choice_01(std::uint32_t& seed) {
+    return static_cast<double>(next_seed(seed) % 2U);
 }
 
-static inline int rand_dir_14(std::uint32_t& seed)
-{
-    return 1 + static_cast<int>(next_seed(seed) % 4u);
+static inline int rand_dir_14(std::uint32_t& seed) {
+    return 1 + static_cast<int>(next_seed(seed) % 4U);
 }
 
-void AntSwarm::initialiser_positions_aleatoires(const fractal_land& land, std::size_t& seed_global)
-{
-    auto gen_ant_pos_x = [&land, &seed_global]() {
-        return rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), seed_global);
-    };
+int to_int_count(std::size_t n, const char* what) {
+    if (n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::overflow_error(std::string(what) + " exceeds MPI int count");
+    }
+    return static_cast<int>(n);
+}
 
-    auto gen_ant_pos_y = [&land, &seed_global]() {
-        const auto row_start = static_cast<std::int32_t>(land.row_start());
-        const auto local_height = static_cast<std::int32_t>(land.local_height());
-        const auto top = row_start;
-        const auto bottom = row_start + local_height - 1;
-        return rand_int32(top, bottom, seed_global);
-    };
+void append_ant_from_bytes(const std::vector<unsigned char>& buffer, std::vector<AntData>& out) {
+    if (buffer.empty()) {
+        return;
+    }
+    if ((buffer.size() % sizeof(AntData)) != 0U) {
+        throw std::runtime_error("Invalid ant migration payload size");
+    }
+    const std::size_t count = buffer.size() / sizeof(AntData);
+    const auto* ptr = reinterpret_cast<const AntData*>(buffer.data());
+    out.insert(out.end(), ptr, ptr + count);
+}
 
-    for (std::size_t i = 0; i < m_x.size(); ++i) {
-        m_x[i] = gen_ant_pos_x();
-        m_y[i] = gen_ant_pos_y();
-        m_is_loaded[i] = 0;
-        m_seed[i] = seed_global;
+} // namespace
+
+AntSwarm::AntSwarm(std::size_t nb_ants) {
+    resize(nb_ants);
+}
+
+void AntSwarm::resize(std::size_t nb_ants) {
+    m_ants.assign(nb_ants, AntData{});
+}
+
+void AntSwarm::initialiser_positions_aleatoires(const fractal_land& land,
+                                                std::size_t& seed_global,
+                                                std::uint64_t id_offset) {
+    for (std::size_t i = 0; i < m_ants.size(); ++i) {
+        auto& ant = m_ants[i];
+        ant.x = rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), seed_global);
+        ant.y = rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), seed_global);
+        ant.is_loaded = 0;
+        ant.seed = static_cast<std::uint32_t>(seed_global);
+        ant.consumed_time = 0.0;
+        ant.id = id_offset + i;
     }
 }
 
-void AntSwarm::advance_one(pheronome& phen, const fractal_land& land,
-                           const position_t& pos_food, const position_t& pos_nest, std::size_t& cpteur_food)
-{
-    int rank, size;
+void AntSwarm::set_from_data(const std::vector<AntData>& ants) {
+    m_ants = ants;
+}
+
+void AntSwarm::export_data(std::vector<AntData>& out) const {
+    out = m_ants;
+}
+
+void AntSwarm::advance_one(pheronome& phen,
+                           const fractal_land& land,
+                           const position_t& pos_food,
+                           const position_t& pos_nest,
+                           std::size_t& food_local,
+                           double& t_comm_migration_ms) {
+    int rank = 0;
+    int size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    
-    std::vector<AntData> send_up;
-    std::vector<AntData> send_down;
-    std::vector<AntData> recv_up;
-    std::vector<AntData> recv_down;
-    std::vector<char> is_sent(m_x.size(), 0);
 
-    // Debut d'une iteration globale: toutes les fourmis ont un budget de deplacement nul consomme.
-    std::fill(consumed_time.begin(), consumed_time.end(), 0.0);
+    const int up = (rank == 0) ? MPI_PROC_NULL : rank - 1;
+    const int down = (rank == size - 1) ? MPI_PROC_NULL : rank + 1;
 
-    // Separation des fourmis actives par etat pour eviter un branchement dans le noyau chaud.
-    std::size_t active_loaded_count = 0;
-    std::size_t active_unloaded_count = 0;
+    for (auto& ant : m_ants) {
+        ant.consumed_time = 0.0;
+    }
 
-    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(m_x.size()); ++i) {
-        if (m_is_loaded[i]) {
-            active_loaded_ids[active_loaded_count++] = i;
+    std::vector<std::size_t> active_loaded;
+    std::vector<std::size_t> active_unloaded;
+    active_loaded.reserve(m_ants.size());
+    active_unloaded.reserve(m_ants.size());
+    for (std::size_t i = 0; i < m_ants.size(); ++i) {
+        if (m_ants[i].is_loaded != 0) {
+            active_loaded.push_back(i);
         } else {
-            active_unloaded_ids[active_unloaded_count++] = i;
+            active_unloaded.push_back(i);
         }
     }
 
-    active_loaded_ids.resize(active_loaded_count);
-    active_unloaded_ids.resize(active_unloaded_count);
+    const int y_start = static_cast<int>(phen.row_start());
+    const int y_end_exclusive = static_cast<int>(phen.row_end());
+    while (true) {
 
-    // Buffers locaux OpenMP
-    next_loaded_ids.clear();
-    next_unloaded_ids.clear();
-
-    next_loaded_ids.reserve(m_x.size() * 2 + 16);
-    next_unloaded_ids.reserve(m_x.size() * 2 + 16);
-    const int nb_threads = omp_get_max_threads();
-    std::vector<std::vector<std::uint32_t>> next_loaded_local(static_cast<std::size_t>(nb_threads));
-    std::vector<std::vector<std::uint32_t>> next_unloaded_local(static_cast<std::size_t>(nb_threads));
-    std::vector<std::vector<position_t>> marks_local(static_cast<std::size_t>(nb_threads));
-    std::vector<std::vector<AntData>> send_up_local(static_cast<std::size_t>(nb_threads));
-    std::vector<std::vector<AntData>> send_down_local(static_cast<std::size_t>(nb_threads));
-    std::vector<std::size_t> food_local(static_cast<std::size_t>(nb_threads), 0);
-    const std::size_t reserve_par_thread =
-        (m_x.size() / static_cast<std::size_t>(nb_threads)) + 64;
-    for (int t = 0; t < nb_threads; ++t) {
-        next_loaded_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
-        next_unloaded_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
-        marks_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
-        send_up_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
-        send_down_local[static_cast<std::size_t>(t)].reserve(reserve_par_thread);
-    }
-
-    auto traiter_liste = [&](std::vector<std::uint32_t>& liste_active,
-                             std::size_t nb_actives,
-                             int ind_pher,
-                             std::vector<std::uint32_t>& liste_next_loaded,
-                             std::vector<std::uint32_t>& liste_next_unloaded)
-    {
-        for (int t = 0; t < nb_threads; ++t) {
-            send_up_local[t].clear();
-            send_down_local[t].clear();
-            next_loaded_local[static_cast<std::size_t>(t)].clear();
-            next_unloaded_local[static_cast<std::size_t>(t)].clear();
-            marks_local[static_cast<std::size_t>(t)].clear();
-            food_local[static_cast<std::size_t>(t)] = 0;
+        int local_active = static_cast<int>(active_loaded.size() + active_unloaded.size());
+        int global_active = 0;
+        double t0_comm = MPI_Wtime();
+        MPI_Allreduce(&local_active, &global_active, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        t_comm_migration_ms += (MPI_Wtime() - t0_comm) * 1000.0;
+        if (global_active == 0) {
+            break;
         }
 
-        #pragma omp parallel if (nb_actives > 1024)
-        {
-            const int tid = omp_get_thread_num();
-            #pragma omp for schedule(guided,64) nowait
-            for (std::int64_t pos = 0; pos < static_cast<std::int64_t>(nb_actives); ++pos) {
-                const std::uint32_t i = liste_active[static_cast<std::size_t>(pos)];
+        std::vector<AntData> send_up;
+        std::vector<AntData> send_down;
+        std::vector<std::size_t> next_loaded;
+        std::vector<std::size_t> next_unloaded;
+        std::vector<char> migrated(m_ants.size(), 0);
 
-                double choix = rand_choice_01(m_seed[i]);
-                position_t old_pos_ant{m_x[i], m_y[i]};
+        send_up.reserve(active_loaded.size() + active_unloaded.size());
+        send_down.reserve(active_loaded.size() + active_unloaded.size());
+        next_loaded.reserve(active_loaded.size() + active_unloaded.size());
+        next_unloaded.reserve(active_loaded.size() + active_unloaded.size());
 
-                if (old_pos_ant.y < 0 || static_cast<std::size_t>(old_pos_ant.y) >= land.dimensions() ||
-                    old_pos_ant.x < 0 || static_cast<std::size_t>(old_pos_ant.x) >= land.dimensions()) {
-                    // pos invalide, remonter / descendre vers le bon rang
-                    AntData d{old_pos_ant.x, old_pos_ant.y, static_cast<int>(m_is_loaded[i]), m_seed[i]};
-                    is_sent[i] = 1;
-                    if (old_pos_ant.y < static_cast<std::int32_t>(phen.row_start())) {
-                        send_up_local[static_cast<std::size_t>(tid)].push_back(d);
-                    } else {
-                        send_down_local[static_cast<std::size_t>(tid)].push_back(d);
-                    }
-                    continue;
-                }
+        auto traiter_liste = [&](const std::vector<std::size_t>& active_ids, int ind_pher) {
+            for (const std::size_t idx : active_ids) {
+                auto& ant = m_ants[idx];
 
-                if (!phen.is_local(static_cast<std::size_t>(old_pos_ant.y))) {
-                    AntData d{old_pos_ant.x, old_pos_ant.y, static_cast<int>(m_is_loaded[i]), m_seed[i]};
-                    is_sent[i] = 1;
-                    if (old_pos_ant.y < static_cast<std::int32_t>(phen.row_start())) {
-                        send_up_local[static_cast<std::size_t>(tid)].push_back(d);
-                    } else {
-                        send_down_local[static_cast<std::size_t>(tid)].push_back(d);
-                    }
-                    continue;
-                }
+                const position_t old_pos{ant.x, ant.y};
+                position_t new_pos = old_pos;
+                const double choix = rand_choice_01(ant.seed);
 
-                position_t new_pos_ant = old_pos_ant;
+                const position_t pos_left{new_pos.x - 1, new_pos.y};
+                const position_t pos_right{new_pos.x + 1, new_pos.y};
+                const position_t pos_up{new_pos.x, new_pos.y - 1};
+                const position_t pos_down{new_pos.x, new_pos.y + 1};
 
-                const position_t pos_gauche{new_pos_ant.x - 1, new_pos_ant.y};
-                const position_t pos_droite{new_pos_ant.x + 1, new_pos_ant.y};
-                const position_t pos_haut{new_pos_ant.x, new_pos_ant.y - 1};
-                const position_t pos_bas{new_pos_ant.x, new_pos_ant.y + 1};
-
-                auto get_pher = [&](const position_t& p) {
-                    const int dim = static_cast<int>(land.dimensions());
-                    if (p.x < 0 || p.x >= dim || p.y < 0 || p.y >= dim) return -1.0;
-
-                    const long row_start = static_cast<long>(phen.row_start());
-                    const long row_end = static_cast<long>(phen.row_start() + phen.local_height() - 1);
-                    const long y = static_cast<long>(p.y);
-                    if (y < row_start - 1 || y > row_end + 1) return -1.0;
-
-                    return phen(static_cast<std::size_t>(p.x), static_cast<std::size_t>(p.y))[ind_pher];
-                };
-
-                double max_phen = std::max({
-                    get_pher(pos_gauche),
-                    get_pher(pos_droite),
-                    get_pher(pos_haut),
-                    get_pher(pos_bas)
-                });
+                const double p_left = phen.pheromone_value(pos_left.x, pos_left.y, ind_pher);
+                const double p_right = phen.pheromone_value(pos_right.x, pos_right.y, ind_pher);
+                const double p_up = phen.pheromone_value(pos_up.x, pos_up.y, ind_pher);
+                const double p_down = phen.pheromone_value(pos_down.x, pos_down.y, ind_pher);
+                const double max_phen = std::max({p_left, p_right, p_up, p_down});
 
                 if ((choix > m_eps) || (max_phen <= 0.0)) {
                     do {
-                        new_pos_ant = old_pos_ant;
-                        int d = rand_dir_14(m_seed[i]);
-
-                        if (d == 1) new_pos_ant.x -= 1;
-                        if (d == 2) new_pos_ant.y -= 1;
-                        if (d == 3) new_pos_ant.x += 1;
-                        if (d == 4) new_pos_ant.y += 1;
-
-                    } while (get_pher(new_pos_ant) == -1.0);
+                        new_pos = old_pos;
+                        const int d = rand_dir_14(ant.seed);
+                        if (d == 1) new_pos.x -= 1;
+                        if (d == 2) new_pos.y -= 1;
+                        if (d == 3) new_pos.x += 1;
+                        if (d == 4) new_pos.y += 1;
+                    } while (phen.pheromone_value(new_pos.x, new_pos.y, ind_pher) < 0.0);
                 } else {
-                    if (get_pher(pos_gauche) == max_phen)
-                        new_pos_ant.x -= 1;
-                    else if (get_pher(pos_droite) == max_phen)
-                        new_pos_ant.x += 1;
-                    else if (get_pher(pos_haut) == max_phen)
-                        new_pos_ant.y -= 1;
-                    else
-                        new_pos_ant.y += 1;
+                    if (p_left == max_phen) {
+                        new_pos.x -= 1;
+                    } else if (p_right == max_phen) {
+                        new_pos.x += 1;
+                    } else if (p_up == max_phen) {
+                        new_pos.y -= 1;
+                    } else {
+                        new_pos.y += 1;
+                    }
                 }
 
-                m_x[i] = new_pos_ant.x;
-                m_y[i] = new_pos_ant.y;
+                ant.x = new_pos.x;
+                ant.y = new_pos.y;
 
-                if (!phen.is_local(static_cast<std::size_t>(new_pos_ant.y))) {
-                    AntData d{new_pos_ant.x, new_pos_ant.y, static_cast<int>(m_is_loaded[i]), m_seed[i]};
-                    is_sent[i] = 1;
-                    if (new_pos_ant.y < old_pos_ant.y) {
-                        send_up_local[static_cast<std::size_t>(tid)].push_back(d);
+                if (new_pos == pos_nest) {
+                    if (ant.is_loaded != 0) {
+                        ++food_local;
+                    }
+                    ant.is_loaded = 0;
+                }
+                if (new_pos == pos_food) {
+                    ant.is_loaded = 1;
+                }
+
+                ant.consumed_time += land.value_at(ant.x, ant.y);
+
+                if (ant.y < y_start || ant.y >= y_end_exclusive) {
+                    migrated[idx] = 1;
+                    if (ant.y < y_start) {
+                        send_up.push_back(ant);
                     } else {
-                        send_down_local[static_cast<std::size_t>(tid)].push_back(d);
+                        send_down.push_back(ant);
                     }
                     continue;
                 }
 
-                marks_local[static_cast<std::size_t>(tid)].push_back(new_pos_ant);
+                phen.mark_pheronome_xy(static_cast<std::size_t>(ant.x), static_cast<std::size_t>(ant.y));
 
-                if (new_pos_ant == pos_nest) {
-                    if (m_is_loaded[i] != 0) {
-                        ++food_local[static_cast<std::size_t>(tid)];
-                    }
-                    m_is_loaded[i] = 0;
-                }
-
-                if (new_pos_ant == pos_food) {
-                    m_is_loaded[i] = 1;
-                }
-
-                consumed_time[i] += land(static_cast<unsigned long>(new_pos_ant.x),
-                                         static_cast<unsigned long>(new_pos_ant.y));
-
-                if (consumed_time[i] < 1.0) {
-                    if (m_is_loaded[i] != 0) {
-                        next_loaded_local[static_cast<std::size_t>(tid)].push_back(i);
+                if (ant.consumed_time < 1.0) {
+                    if (ant.is_loaded != 0) {
+                        next_loaded.push_back(idx);
                     } else {
-                        next_unloaded_local[static_cast<std::size_t>(tid)].push_back(i);
+                        next_unloaded.push_back(idx);
                     }
                 }
             }
+        };
+
+        traiter_liste(active_unloaded, 0);
+        traiter_liste(active_loaded, 1);
+
+        std::vector<unsigned char> send_up_bytes;
+        std::vector<unsigned char> send_down_bytes;
+        send_up_bytes.resize(send_up.size() * sizeof(AntData));
+        send_down_bytes.resize(send_down.size() * sizeof(AntData));
+        if (!send_up.empty()) {
+            std::memcpy(send_up_bytes.data(), send_up.data(), send_up_bytes.size());
+        }
+        if (!send_down.empty()) {
+            std::memcpy(send_down_bytes.data(), send_down.data(), send_down_bytes.size());
         }
 
-        // Fusion séquentielle: on évite la contention pendant le noyau chaud.
-        for (int t = 0; t < nb_threads; ++t) {
-            cpteur_food += food_local[static_cast<std::size_t>(t)];
-
-            for (const AntData& d : send_up_local[static_cast<std::size_t>(t)]) {
-                send_up.push_back(d);
-            }
-            for (const AntData& d : send_down_local[static_cast<std::size_t>(t)]) {
-                send_down.push_back(d);
-            }
-
-            for (const position_t& pos : marks_local[static_cast<std::size_t>(t)]) {
-                phen.mark_pheronome_xy(static_cast<std::size_t>(pos.x),
-                                       static_cast<std::size_t>(pos.y));
-            }
-
-            for (std::uint32_t i : next_loaded_local[static_cast<std::size_t>(t)]) {
-                liste_next_loaded.push_back(i);
-            }
-
-            for (std::uint32_t i : next_unloaded_local[static_cast<std::size_t>(t)]) {
-                liste_next_unloaded.push_back(i);
-            }
-        }
-    };
-
-    MPI_Datatype MPI_AntData;
-    {
-        AntData dummy;
-        MPI_Aint base;
-        MPI_Get_address(&dummy, &base);
-        MPI_Aint displs[4];
-        MPI_Get_address(&dummy.x, &displs[0]);
-        MPI_Get_address(&dummy.y, &displs[1]);
-        MPI_Get_address(&dummy.is_loaded, &displs[2]);
-        MPI_Get_address(&dummy.seed, &displs[3]);
-        for (int i = 0; i < 4; ++i) displs[i] -= base;
-        int blocklens[4] = {1, 1, 1, 1};
-        MPI_Datatype types[4] = {MPI_INT, MPI_INT, MPI_INT, MPI_UINT32_T};
-        MPI_Type_create_struct(4, blocklens, displs, types, &MPI_AntData);
-        MPI_Type_commit(&MPI_AntData);
-    }
-
-    int up = (rank == 0) ? MPI_PROC_NULL : rank - 1;
-    int down = (rank == size - 1) ? MPI_PROC_NULL : rank + 1;
-
-    std::size_t move_round = 0;
-    const std::size_t max_move_rounds = std::max<std::size_t>(static_cast<std::size_t>(land.dimensions()) * 3, 1024);
-
-    while ((active_loaded_count + active_unloaded_count) != 0 && move_round < max_move_rounds) {
-        ++move_round;
-
-        send_up.clear();
-        send_down.clear();
-
-        next_loaded_ids.clear();
-        next_unloaded_ids.clear();
-
-        traiter_liste(active_unloaded_ids,
-                      active_unloaded_count,
-                      0,
-                      next_loaded_ids,
-                      next_unloaded_ids);
-
-        traiter_liste(active_loaded_ids,
-                      active_loaded_count,
-                      1,
-                      next_loaded_ids,
-                      next_unloaded_ids);
-
-        int send_up_count = static_cast<int>(send_up.size());
-        int send_down_count = static_cast<int>(send_down.size());
+        int send_up_count = to_int_count(send_up_bytes.size(), "send_up bytes");
+        int send_down_count = to_int_count(send_down_bytes.size(), "send_down bytes");
         int recv_up_count = 0;
         int recv_down_count = 0;
 
+        t0_comm = MPI_Wtime();
         MPI_Sendrecv(&send_up_count, 1, MPI_INT, up, 10,
                      &recv_down_count, 1, MPI_INT, down, 10,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
         MPI_Sendrecv(&send_down_count, 1, MPI_INT, down, 11,
                      &recv_up_count, 1, MPI_INT, up, 11,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-        recv_up.resize(static_cast<std::size_t>(recv_up_count));
-        recv_down.resize(static_cast<std::size_t>(recv_down_count));
+        std::vector<unsigned char> recv_up_bytes(static_cast<std::size_t>(recv_up_count), 0U);
+        std::vector<unsigned char> recv_down_bytes(static_cast<std::size_t>(recv_down_count), 0U);
 
-        MPI_Sendrecv(send_up.data(), send_up_count, MPI_AntData, up, 20,
-                     recv_down.data(), recv_down_count, MPI_AntData, down, 20,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Sendrecv(send_up_count > 0 ? send_up_bytes.data() : nullptr,
+                     send_up_count,
+                     MPI_BYTE,
+                     up,
+                     20,
+                     recv_down_count > 0 ? recv_down_bytes.data() : nullptr,
+                     recv_down_count,
+                     MPI_BYTE,
+                     down,
+                     20,
+                     MPI_COMM_WORLD,
+                     MPI_STATUS_IGNORE);
 
-        MPI_Sendrecv(send_down.data(), send_down_count, MPI_AntData, down, 21,
-                     recv_up.data(), recv_up_count, MPI_AntData, up, 21,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Sendrecv(send_down_count > 0 ? send_down_bytes.data() : nullptr,
+                     send_down_count,
+                     MPI_BYTE,
+                     down,
+                     21,
+                     recv_up_count > 0 ? recv_up_bytes.data() : nullptr,
+                     recv_up_count,
+                     MPI_BYTE,
+                     up,
+                     21,
+                     MPI_COMM_WORLD,
+                     MPI_STATUS_IGNORE);
+        t_comm_migration_ms += (MPI_Wtime() - t0_comm) * 1000.0;
 
-        auto add_received = [&](const AntData &ant) {
-            m_x.push_back(ant.x);
-            m_y.push_back(ant.y);
-            m_is_loaded.push_back(static_cast<std::uint8_t>(ant.is_loaded));
-            m_seed.push_back(ant.seed);
-            consumed_time.push_back(0.0);
-            is_sent.push_back(0);
-            std::uint32_t new_index = static_cast<std::uint32_t>(m_x.size() - 1);
-            if (ant.is_loaded != 0) {
-                next_loaded_ids.push_back(new_index);
-            } else {
-                next_unloaded_ids.push_back(new_index);
+        std::vector<int> remap(m_ants.size(), -1);
+        std::vector<AntData> survivors;
+        survivors.reserve(m_ants.size());
+        for (std::size_t i = 0; i < m_ants.size(); ++i) {
+            if (migrated[i] == 0) {
+                remap[i] = static_cast<int>(survivors.size());
+                survivors.push_back(m_ants[i]);
             }
-        };
-
-        for (const AntData &ant : recv_up) add_received(ant);
-        for (const AntData &ant : recv_down) add_received(ant);
-
-        std::swap(active_loaded_ids, next_loaded_ids);
-        std::swap(active_unloaded_ids, next_unloaded_ids);
-
-        active_loaded_count = active_loaded_ids.size();
-        active_unloaded_count = active_unloaded_ids.size();
-    }
-
-    if (move_round >= max_move_rounds) {
-        // Sécurité: si trop de rondes à cause de terrain 0, on force la fin du mouvement
-        std::size_t stuck = active_loaded_count + active_unloaded_count;
-        if (stuck > 0) {
-            std::cerr << "avertissement: max_move_rounds atteint (" << move_round << ")";
-            std::cerr << " | restants=" << stuck << "\n";
         }
-    }
+        m_ants.swap(survivors);
 
-    std::size_t compact_write = 0;
-    for (std::size_t read = 0, total = m_x.size(); read < total; ++read) {
-        if (is_sent[read]) continue;
-        if (compact_write != read) {
-            m_x[compact_write] = m_x[read];
-            m_y[compact_write] = m_y[read];
-            m_is_loaded[compact_write] = m_is_loaded[read];
-            m_seed[compact_write] = m_seed[read];
-            consumed_time[compact_write] = consumed_time[read];
+        std::vector<std::size_t> remapped_loaded;
+        std::vector<std::size_t> remapped_unloaded;
+        remapped_loaded.reserve(next_loaded.size());
+        remapped_unloaded.reserve(next_unloaded.size());
+
+        for (const std::size_t idx : next_loaded) {
+            if (remap[idx] >= 0) {
+                remapped_loaded.push_back(static_cast<std::size_t>(remap[idx]));
+            }
         }
-        ++compact_write;
+        for (const std::size_t idx : next_unloaded) {
+            if (remap[idx] >= 0) {
+                remapped_unloaded.push_back(static_cast<std::size_t>(remap[idx]));
+            }
+        }
+
+        std::vector<AntData> received;
+        received.reserve(static_cast<std::size_t>(recv_up_count + recv_down_count) / sizeof(AntData));
+        append_ant_from_bytes(recv_up_bytes, received);
+        append_ant_from_bytes(recv_down_bytes, received);
+
+        for (const auto& ant : received) {
+            const std::size_t new_index = m_ants.size();
+            m_ants.push_back(ant);
+            if (ant.y >= y_start && ant.y < y_end_exclusive) {
+                phen.mark_pheronome_xy(static_cast<std::size_t>(ant.x), static_cast<std::size_t>(ant.y));
+            }
+            if (ant.consumed_time < 1.0) {
+                if (ant.is_loaded != 0) {
+                    remapped_loaded.push_back(new_index);
+                } else {
+                    remapped_unloaded.push_back(new_index);
+                }
+            }
+        }
+
+        active_loaded.swap(remapped_loaded);
+        active_unloaded.swap(remapped_unloaded);
     }
-
-    m_x.resize(compact_write);
-    m_y.resize(compact_write);
-    m_is_loaded.resize(compact_write);
-    m_seed.resize(compact_write);
-    consumed_time.resize(compact_write);
-    is_sent.resize(compact_write);
-
-    std::size_t global_food = 0;
-    MPI_Allreduce(&cpteur_food, &global_food, 1, MPI_UNSIGNED_LONG, MPI_SUM, MPI_COMM_WORLD);
-    cpteur_food = global_food;
-
-    MPI_Type_free(&MPI_AntData);
 }

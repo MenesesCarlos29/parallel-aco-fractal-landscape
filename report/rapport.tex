@@ -134,7 +134,7 @@
 % ====================================================
 \section{Introduction et environnement d'execution}
 
-Ce projet etudie l'optimisation d'une simulation de colonie de fourmis sur paysage fractal, avec une progression volontairement structuree en quatre etapes. Q0 etablit la baseline monocoeur et l'analyse des hotspots, Q1 introduit l'instrumentation temporelle, Q2 restructure les donnees et simplifie le noyau chaud, puis Q3 ajoute une parallelisation OpenMP en memoire partagee. Le fil directeur du rapport est de distinguer clairement les gains dus a la mesure, a l'organisation memoire, puis a la parallelisation, tout en verifiant a chaque etape la reproductibilite fonctionnelle.
+Ce projet etudie l'optimisation d'une simulation de colonie de fourmis sur paysage fractal, avec une progression volontairement structuree en six etapes. Q0 etablit la baseline monocoeur et l'analyse des hotspots, Q1 introduit l'instrumentation temporelle, Q2 restructure les donnees et simplifie le noyau chaud, Q3 ajoute une parallelisation OpenMP en memoire partagee, Q4 introduit une parallelisation MPI par replication complete de l'environnement, puis Q5 met en place une decomposition de domaine avec halos et migration d'agents. Le fil directeur du rapport est de distinguer clairement les gains dus a la mesure, a l'organisation memoire, puis aux differents modeles de parallelisation, tout en verifiant a chaque etape la reproductibilite fonctionnelle.
 
 \subsection{Methodologie experimentale et reproductibilite}
 
@@ -142,9 +142,9 @@ Ce projet etudie l'optimisation d'une simulation de colonie de fourmis sur paysa
 Le protocole vise une comparaison reproductible. La graine initiale est fixe a \texttt{2026} dans les executables Qx. Un \emph{warm-up} complet est execute avant les repetitions mesurees afin de chauffer les caches et n'est jamais comptabilise dans les resultats exportes. La validation fonctionnelle repose sur deux indicateurs : \texttt{Food\_KPI}, qui compte la nourriture ramenee au nid, et un \texttt{Checksum} construit a partir de l'etat final des fourmis et des pheromones. Toute optimisation retenue doit conserver ces deux quantites.
 \end{formal}
 
-Le protocole scientifique vise un \textbf{scope compute strict}, c'est-a-dire des mesures concentrees sur la boucle de calcul avec rendu SDL desactive via \texttt{--gui 0}. En pratique, le depot conserve deux familles de campagnes : les campagnes historiques Q0 et Q1, qui correspondent a des executions completes avec influence du rendu, et les campagnes finales Q2 et Q3, qui ont ete consolidees en mode headless pour isoler le calcul. Le rapport signale explicitement cette difference afin d'eviter toute comparaison abusive entre temps applicatifs complets et temps purement compute.
+Le protocole scientifique vise un \textbf{scope compute strict}, c'est-a-dire des mesures concentrees sur la boucle de calcul avec rendu SDL desactive via \texttt{--gui 0}. En pratique, le depot conserve deux familles de campagnes : les campagnes historiques Q0 et Q1, qui correspondent a des executions completes avec influence du rendu, et les campagnes finales Q2, Q3, Q4 et Q5, qui ont ete consolidees en mode headless pour isoler le calcul. Le rapport signale explicitement cette difference afin d'eviter toute comparaison abusive entre temps applicatifs complets et temps purement compute.
 
-Toutes les campagnes exploitees dans ce document reposent sur \textbf{5 repetitions} avec warm-up prealable, mais leur perimetre de mesure n'est pas uniforme entre les premieres etapes et les campagnes finales.
+Les campagnes sequentielles et OpenMP exploitees ici reposent sur \textbf{5 repetitions} avec warm-up prealable. En revanche, les campagnes de scalabilite MPI de Q4 et Q5 ont ete archivees avec un protocole plus leger, typiquement \textbf{une repetition mesuree par configuration} dans les CSV de \texttt{final\_results/}, afin de limiter le cout experimental des executions multi-processus.
 
 \subsection{Machine de test}
 
@@ -182,8 +182,10 @@ Le depot est structure par etapes independantes :
   \item \texttt{Q1/} : version instrumentee avec decomposition temporelle ;
   \item \texttt{Q2/} : version SoA et optimisations du noyau chaud ;
   \item \texttt{Q3/} : version OpenMP en memoire partagee ;
+  \item \texttt{Q4/} : version MPI a environnement replique ;
+  \item \texttt{Q5/} : version MPI par decomposition de domaine ;
   \item \texttt{results/} : mesures historiques et campagnes compute intermediaires ;
-  \item \texttt{final\_results/} : campagne finale Q3 et figures de scalabilite.
+  \item \texttt{final\_results/} : campagnes finales consolidees et figures de scalabilite pour Q3, Q4 et Q5.
 \end{itemize}
 
 Cette organisation garantit la tracabilite des modifications et facilite la comparaison entre versions.
@@ -826,6 +828,8 @@ S(p) = \frac{T_s}{T_p} \qquad\qquad E(p) = \frac{S(p)}{p}
   \end{tabular}
 \end{table}
 
+La verification fonctionnelle retenue pour la Q4 s'appuie sur \texttt{First\_Iteration} et \texttt{Food\_KPI}. Les fichiers \texttt{final\_results/Q4\_scaling\_np1.csv}, \texttt{Q4\_scaling\_np2.csv} et \texttt{Q4\_scaling\_np4.csv} montrent la conservation de \texttt{First\_Iteration = 1236} et \texttt{Food\_KPI = 4353} pour les configurations mesurees, ce qui confirme que la distribution des fourmis ne modifie pas ces observables globaux.
+
 L'analyse de la Q4 montre que la version MPI reste competitive a 1 processus avec un speedup de 1.086. Cette legere amelioration par rapport a Q2 s'explique par la restructuration du code et l'absence de certains mecanismes de gestion de threads propres a OpenMP. Cependant, les performances se degradent severement lors de la montee en charge.
 
 Le passage a 2 processus entraine un doublement du temps d'execution ($T_2 = 11197.313$ ms), faisant chuter le speedup a 0.538. A 4 processus, le temps s'effondre a 29837.727 ms. Cette degradation est la consequence directe du cout de synchronisation via \texttt{MPI\_Allreduce}. Les donnees de profilage indiquent que la communication absorbe la majorite du temps CPU, confirmant que le ratio calcul/communication est defavorable pour cette resolution de grille.
@@ -985,6 +989,10 @@ où $M$ est le nombre total de fourmis et $N$ la résolution spatiale. Comparé 
 L'amélioration expose un écart linéaire en $N$, ce qui signifie que pour une grille volumineuse, le rapport calcul-communication en Q5 devient favorable bien avant celui de la Q4.
 
 Cette transformation du bilan énergétique communication-calcul est la clé scientifique permettant à la décomposition de domaine de surmonter le handicap du déséquilibre de charge vis-à-vis de la réplication distribuée.
+
+\subsection{Validation fonctionnelle}
+
+La verification fonctionnelle de la Q5 repose elle aussi sur \texttt{First\_Iteration} et \texttt{Food\_KPI}. Les campagnes archivees dans \texttt{final\_results/Q5\_scaling\_np1.csv}, \texttt{Q5\_scaling\_np2.csv} et \texttt{Q5\_scaling\_np4.csv} conservent \texttt{First\_Iteration = 1236} et \texttt{Food\_KPI = 4353}. Cette stabilite est importante : elle montre que la decomposition de domaine, l'echange de halos et la migration des fourmis preservent bien les observables fonctionnels principaux du baseline.
 
 
 

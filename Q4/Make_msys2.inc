@@ -1,5 +1,5 @@
-CXX = g++ -fopenmp
-CC  = gcc -fopenmp
-MPICXX = mpic++ -fopenmp
+CXX = g++
+CC  = gcc
+MPICXX = mpic++
 LIB = 
 BLAS = -lopenblas

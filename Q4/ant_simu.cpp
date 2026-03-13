@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -11,11 +10,11 @@
 #include <limits>
 #include <memory>
 #include <numeric>
-#include <omp.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
 #include <mpi.h>
 
 #include "ant.hpp"
@@ -43,16 +42,34 @@ struct ParametresFractal {
     std::size_t taille_effective = 513;
 };
 
-struct MesuresRepetition {
-    double t_move_ants_ms = 0.0;
-    double t_evap_ms = 0.0;
-    double t_pher_update_ms = 0.0;
+struct PartitionFourmis {
+    std::size_t debut = 0;
+    std::size_t fin = 0;
+    std::size_t nb_ants = 0;
+};
+
+struct MesuresLocales {
+    double t_compute_move_ms = 0.0;
+    double t_compute_evap_ms = 0.0;
+    double t_compute_update_ms = 0.0;
     double t_render_ms = 0.0;
+    double t_compute_ms = 0.0;
+    double t_comm_food_ms = 0.0;
+    double t_comm_pher_ms = 0.0;
+    double t_comm_ms = 0.0;
     double t_total_ms = 0.0;
+    double ecart_sanity_ms = 0.0;
     std::size_t premiere_iteration_nourriture = 0;
     std::size_t food_kpi = 0;
-    std::size_t iterations_executees = 0;
-    std::uint64_t checksum = 0;
+    std::uint64_t checksum_global = 0;
+};
+
+struct ReferenceBaseline {
+    bool disponible = false;
+    std::string message;
+    std::filesystem::path chemin_source;
+    std::vector<std::size_t> food_kpi;
+    std::vector<std::uint64_t> checksums;
 };
 
 void afficher_aide(const char* programme) {
@@ -71,8 +88,6 @@ void afficher_aide(const char* programme) {
         << "  --help          Affiche cette aide\n";
 }
 
-// taille=nb_graines⋅(2^(k))+1
-// k = puissance 
 ParametresFractal construire_parametres_fractal(std::size_t taille_demandee) {
     if (taille_demandee < 3) {
         throw std::invalid_argument("--grid-size doit etre >= 3.");
@@ -198,10 +213,9 @@ void melanger_checksum(std::uint64_t& checksum, std::uint64_t valeur) {
     checksum ^= valeur + 0x9e3779b97f4a7c15ULL + (checksum << 6U) + (checksum >> 2U);
 }
 
-std::uint64_t calculer_checksum(const pheronome& phen, const AntSwarm& ants) {
+std::uint64_t calculer_checksum_feromones(const pheronome& phen) {
     std::uint64_t checksum = 1469598103934665603ULL;
     const std::size_t dim = phen.dimensions();
-
     for (std::size_t i = 0; i < dim; ++i) {
         for (std::size_t j = 0; j < dim; ++j) {
             const auto& cellule = phen(i, j);
@@ -209,40 +223,172 @@ std::uint64_t calculer_checksum(const pheronome& phen, const AntSwarm& ants) {
             melanger_checksum(checksum, bits_double(cellule[1]));
         }
     }
-
-    for (std::size_t i = 0; i < ants.size(); ++i) {
-        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(ants.x_at(i))));
-        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(ants.y_at(i))));
-        melanger_checksum(checksum, ants.is_loaded_at(i) ? 0xA5A5A5A5ULL : 0x5A5A5A5AULL);
-    }
-
     return checksum;
 }
 
-struct ReferenceBaseline {
-    bool disponible = false;
-    std::string message;
-    std::vector<std::size_t> food_kpi;
-    std::vector<std::uint64_t> checksums;
-};
+double calculer_moyenne(const std::vector<double>& valeurs) {
+    const double somme = std::accumulate(valeurs.begin(), valeurs.end(), 0.0);
+    return somme / static_cast<double>(valeurs.size());
+}
 
-ReferenceBaseline charger_reference_baseline(const std::filesystem::path& chemin_csv) {
+double calculer_ecart_type(const std::vector<double>& valeurs, double moyenne) {
+    const double somme_carres =
+        std::inner_product(valeurs.begin(), valeurs.end(), valeurs.begin(), 0.0);
+    double variance = somme_carres / static_cast<double>(valeurs.size()) - moyenne * moyenne;
+    if (variance < 0.0 && variance > -1e-12) {
+        variance = 0.0;
+    }
+    return std::sqrt(std::max(0.0, variance));
+}
+
+PartitionFourmis construire_partition(std::size_t nb_ants_total, int rank, int size) {
+    const std::size_t base = nb_ants_total / static_cast<std::size_t>(size);
+    const std::size_t reste = nb_ants_total % static_cast<std::size_t>(size);
+
+    PartitionFourmis part;
+    if (static_cast<std::size_t>(rank) < reste) {
+        part.nb_ants = base + 1ULL;
+        part.debut = static_cast<std::size_t>(rank) * part.nb_ants;
+    } else {
+        part.nb_ants = base;
+        part.debut = reste * (base + 1ULL) + (static_cast<std::size_t>(rank) - reste) * base;
+    }
+    part.fin = part.debut + part.nb_ants;
+    return part;
+}
+
+std::vector<int> construire_counts(std::size_t nb_ants_total, int size) {
+    std::vector<int> counts(static_cast<std::size_t>(size), 0);
+    for (int r = 0; r < size; ++r) {
+        const auto part = construire_partition(nb_ants_total, r, size);
+        if (part.nb_ants > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error("Trop de fourmis pour MPI_Gatherv.");
+        }
+        counts[static_cast<std::size_t>(r)] = static_cast<int>(part.nb_ants);
+    }
+    return counts;
+}
+
+std::vector<int> construire_displacements(const std::vector<int>& counts) {
+    std::vector<int> displs(counts.size(), 0);
+    for (std::size_t i = 1; i < counts.size(); ++i) {
+        displs[i] = displs[i - 1] + counts[i - 1];
+    }
+    return displs;
+}
+
+void avancer_seed_initialisation(const fractal_land& land, std::size_t nb_ants_skip, std::size_t& seed) {
+    for (std::size_t i = 0; i < nb_ants_skip; ++i) {
+        (void)rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), seed);
+        (void)rand_int32(1, static_cast<std::int32_t>(land.dimensions() - 2), seed);
+    }
+}
+
+void initialiser_partition_fourmis(const fractal_land& land,
+                                   const Config& cfg,
+                                   const PartitionFourmis& part,
+                                   AntSwarm& ants) {
+    ants.resize(part.nb_ants);
+    std::size_t seed_local = cfg.seed;
+    avancer_seed_initialisation(land, part.debut, seed_local);
+    ants.initialiser_positions_aleatoires(land, seed_local);
+}
+
+std::uint64_t calculer_checksum_global(const pheronome& phen,
+                                       const AntSwarm& ants_local,
+                                       std::size_t nb_ants_total,
+                                       int rank,
+                                       const std::vector<int>& counts,
+                                       const std::vector<int>& displs) {
+    const int local_count = static_cast<int>(ants_local.size());
+
+    std::vector<int> local_x(static_cast<std::size_t>(local_count), 0);
+    std::vector<int> local_y(static_cast<std::size_t>(local_count), 0);
+    std::vector<unsigned char> local_loaded(static_cast<std::size_t>(local_count), 0U);
+    for (int i = 0; i < local_count; ++i) {
+        const auto idx = static_cast<std::size_t>(i);
+        local_x[idx] = ants_local.x_at(idx);
+        local_y[idx] = ants_local.y_at(idx);
+        local_loaded[idx] = static_cast<unsigned char>(ants_local.is_loaded_at(idx) ? 1U : 0U);
+    }
+
+    std::vector<int> global_x;
+    std::vector<int> global_y;
+    std::vector<unsigned char> global_loaded;
+    if (rank == 0) {
+        global_x.resize(nb_ants_total, 0);
+        global_y.resize(nb_ants_total, 0);
+        global_loaded.resize(nb_ants_total, 0U);
+    }
+
+    MPI_Gatherv(local_x.empty() ? nullptr : local_x.data(),
+                local_count,
+                MPI_INT,
+                (rank == 0 && !global_x.empty()) ? global_x.data() : nullptr,
+                rank == 0 ? counts.data() : nullptr,
+                rank == 0 ? displs.data() : nullptr,
+                MPI_INT,
+                0,
+                MPI_COMM_WORLD);
+
+    MPI_Gatherv(local_y.empty() ? nullptr : local_y.data(),
+                local_count,
+                MPI_INT,
+                (rank == 0 && !global_y.empty()) ? global_y.data() : nullptr,
+                rank == 0 ? counts.data() : nullptr,
+                rank == 0 ? displs.data() : nullptr,
+                MPI_INT,
+                0,
+                MPI_COMM_WORLD);
+
+    MPI_Gatherv(local_loaded.empty() ? nullptr : local_loaded.data(),
+                local_count,
+                MPI_UNSIGNED_CHAR,
+                (rank == 0 && !global_loaded.empty()) ? global_loaded.data() : nullptr,
+                rank == 0 ? counts.data() : nullptr,
+                rank == 0 ? displs.data() : nullptr,
+                MPI_UNSIGNED_CHAR,
+                0,
+                MPI_COMM_WORLD);
+
+    if (rank != 0) {
+        return 0ULL;
+    }
+
+    std::uint64_t checksum = calculer_checksum_feromones(phen);
+    for (std::size_t i = 0; i < nb_ants_total; ++i) {
+        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(global_x[i])));
+        melanger_checksum(checksum, static_cast<std::uint64_t>(static_cast<std::uint32_t>(global_y[i])));
+        melanger_checksum(checksum, global_loaded[i] != 0U ? 0xA5A5A5A5ULL : 0x5A5A5A5AULL);
+    }
+    return checksum;
+}
+
+ReferenceBaseline charger_reference_baseline_q2(const std::vector<std::filesystem::path>& chemins) {
     ReferenceBaseline reference;
 
-    if (!std::filesystem::exists(chemin_csv)) {
-        reference.message = "fichier de reference absent";
+    std::filesystem::path chemin_valide;
+    for (const auto& candidat : chemins) {
+        if (std::filesystem::exists(candidat)) {
+            chemin_valide = candidat;
+            break;
+        }
+    }
+
+    if (chemin_valide.empty()) {
+        reference.message = "fichier de reference Q2 absent";
         return reference;
     }
 
-    std::ifstream fichier(chemin_csv);
+    std::ifstream fichier(chemin_valide);
     if (!fichier.is_open()) {
-        reference.message = "impossible d'ouvrir le fichier de reference";
+        reference.message = "impossible d'ouvrir la reference Q2";
         return reference;
     }
 
     std::string ligne;
     if (!std::getline(fichier, ligne)) {
-        reference.message = "fichier de reference vide";
+        reference.message = "reference Q2 vide";
         return reference;
     }
 
@@ -283,121 +429,95 @@ ReferenceBaseline charger_reference_baseline(const std::filesystem::path& chemin
     }
 
     if (reference.food_kpi.empty() || reference.checksums.empty()) {
-        reference.message = "aucune repetition exploitable dans la reference";
+        reference.message = "aucune repetition exploitable dans la reference Q2";
         return reference;
     }
 
     reference.disponible = true;
-    reference.message = "reference chargee";
+    reference.chemin_source = chemin_valide;
+    reference.message = "reference Q2 chargee";
     return reference;
 }
 
-void afficher_verification_reproductibilite_openmp(const std::vector<std::size_t>& food_kpi_q3,
-                                                   const std::vector<std::uint64_t>& checksums_q3) {
-    const auto reference = charger_reference_baseline("../results/Q3_threads1_reference.csv");
-    const int nb_threads = omp_get_max_threads();
+void afficher_verification_baseline_q2(int mpi_size,
+                                       const std::vector<std::size_t>& food_kpi_q4,
+                                       const std::vector<std::uint64_t>& checksums_q4) {
+    if (mpi_size != 1) {
+        std::cout << "Verification baseline Q2: A_VERIFIER"
+                  << " | raison=verification reservee a np=1\n";
+        return;
+    }
+
+    const std::vector<std::filesystem::path> candidats = {
+        "Q2/results/Q2_timings_breakdown.csv",
+        "../Q2/results/Q2_timings_breakdown.csv",
+        "results/Q2_timings_breakdown.csv",
+        "../results/Q2_timings_breakdown.csv"
+    };
+    const auto reference = charger_reference_baseline_q2(candidats);
 
     if (!reference.disponible) {
-        std::cout << "Verification reproductibilite OpenMP (reference 1 thread): A_VERIFIER"
-                  << " | threads=" << nb_threads
-                  << " | raison=" << reference.message;
-        if (nb_threads == 1) {
-            std::cout << " | Cette execution peut servir de reference.";
-        }
-        std::cout << "\n";
+        std::cout << "Verification baseline Q2: A_VERIFIER"
+                  << " | raison=" << reference.message << "\n";
         return;
     }
 
     const std::size_t nb_compare = std::min(
-        food_kpi_q3.size(),
+        food_kpi_q4.size(),
         std::min(reference.food_kpi.size(), reference.checksums.size())
     );
-
     if (nb_compare == 0) {
-        std::cout << "Verification reproductibilite OpenMP (reference 1 thread): A_VERIFIER"
-                  << " | threads=" << nb_threads
+        std::cout << "Verification baseline Q2: A_VERIFIER"
                   << " | raison=aucune repetition commune\n";
         return;
     }
 
-    std::size_t nb_food_identique = 0;
-    std::size_t nb_food_proche = 0;
-    std::size_t nb_checksum_identique = 0;
-
+    bool all_match = true;
     for (std::size_t i = 0; i < nb_compare; ++i) {
-        const long long ecart_food = std::llabs(
-            static_cast<long long>(food_kpi_q3[i]) - static_cast<long long>(reference.food_kpi[i])
-        );
-        const bool food_identique = (ecart_food == 0);
-        const bool food_proche = (ecart_food <= 1);
-        const bool checksum_identique = (checksums_q3[i] == reference.checksums[i]);
-
-        nb_food_identique += static_cast<std::size_t>(food_identique);
-        nb_food_proche += static_cast<std::size_t>(food_proche);
-        nb_checksum_identique += static_cast<std::size_t>(checksum_identique);
+        if (food_kpi_q4[i] != reference.food_kpi[i] || checksums_q4[i] != reference.checksums[i]) {
+            all_match = false;
+            break;
+        }
     }
 
-    std::string statut = "A_VERIFIER";
-    if (nb_food_identique == nb_compare && nb_checksum_identique == nb_compare
-        && nb_compare == food_kpi_q3.size()) {
-        statut = "OK_STRICT";
-    } else if (nb_food_proche == nb_compare) {
-        statut = "OK_FOOD_PROCHE";
-    }
-
-    std::cout << "Verification reproductibilite OpenMP (reference 1 thread): "
-              << statut
-              << " | threads=" << nb_threads
-              << " | Food_identique=" << nb_food_identique << "/" << nb_compare
-              << " | Food_proche=" << nb_food_proche << "/" << nb_compare
-              << " | Checksum_identique=" << nb_checksum_identique << "/" << nb_compare
-              << " | repetitions_comparees=" << nb_compare << "/" << food_kpi_q3.size() << "\n";
-
-    if (nb_food_proche != nb_compare || nb_checksum_identique != nb_compare) {
+    if (!all_match) {
+        std::cout << "Verification baseline Q2: MISMATCH"
+                  << " | source=" << reference.chemin_source.string()
+                  << " | repetitions_comparees=" << nb_compare << "/" << food_kpi_q4.size() << "\n";
         for (std::size_t i = 0; i < nb_compare; ++i) {
-            const long long ecart_food = std::llabs(
-                static_cast<long long>(food_kpi_q3[i]) - static_cast<long long>(reference.food_kpi[i])
-            );
-            if (ecart_food > 1 || checksums_q3[i] != reference.checksums[i]) {
+            if (food_kpi_q4[i] != reference.food_kpi[i] || checksums_q4[i] != reference.checksums[i]) {
                 std::cout << "  Rep " << (i + 1)
-                          << " | Q3(Food_KPI=" << food_kpi_q3[i]
-                          << ", Checksum=" << checksums_q3[i]
-                          << ") vs Reference(Food_KPI=" << reference.food_kpi[i]
+                          << " | Q4(Food_KPI=" << food_kpi_q4[i]
+                          << ", Checksum=" << checksums_q4[i]
+                          << ") vs Q2(Food_KPI=" << reference.food_kpi[i]
                           << ", Checksum=" << reference.checksums[i] << ")\n";
             }
         }
+        return;
     }
+
+    std::cout << "Verification baseline Q2: MATCH_VALUE_ONLY"
+              << " | source=" << reference.chemin_source.string()
+              << " | repetitions_comparees=" << nb_compare << "/" << food_kpi_q4.size()
+              << " | raison=reference_csv_sans_metadonnees_parametres\n";
 }
 
-double calculer_moyenne(const std::vector<double>& valeurs) {
-    const double somme = std::accumulate(valeurs.begin(), valeurs.end(), 0.0);
-    return somme / static_cast<double>(valeurs.size());
-}
-
-double calculer_ecart_type(const std::vector<double>& valeurs, double moyenne) {
-    const double somme_carres =
-        std::inner_product(valeurs.begin(), valeurs.end(), valeurs.begin(), 0.0);
-    double variance = somme_carres / static_cast<double>(valeurs.size()) - moyenne * moyenne;
-    if (variance < 0.0 && variance > -1e-12) {
-        variance = 0.0;
-    }
-    return std::sqrt(std::max(0.0, variance));
-}
-
-MesuresRepetition executer_repetition(const Config& cfg,
-                                      const ParametresFractal& params_fractal,
-                                      bool activer_gui,
-                                      int rank, int size)
-{
-    using horloge = std::chrono::high_resolution_clock;
-
-    std::size_t current_seed = cfg.seed;
+MesuresLocales executer_repetition(const Config& cfg,
+                                   const ParametresFractal& params_fractal,
+                                   bool activer_gui,
+                                   int rank,
+                                   int size,
+                                   const PartitionFourmis& partition,
+                                   const std::vector<int>& counts,
+                                   const std::vector<int>& displs,
+                                   bool calculer_checksum) {
+    const bool gui_local = activer_gui && (rank == 0);
 
     fractal_land land(
         params_fractal.log2_sous_grille,
         params_fractal.nb_graines,
         1.0,
-        static_cast<int>(current_seed & 0x7fffffffU)
+        static_cast<int>(cfg.seed & 0x7fffffffU)
     );
     normaliser_terrain(land);
 
@@ -414,41 +534,39 @@ MesuresRepetition executer_repetition(const Config& cfg,
         pos_food.x = std::min(pos_food.x + 1, borne_max);
     }
 
-    std::size_t ants_per_proc = cfg.nb_ants / size;
-    std::size_t start_ant = rank * ants_per_proc;  
-
-    std::size_t end_ant = (rank == size - 1) ? cfg.nb_ants : start_ant + ants_per_proc;
-    std::size_t my_nb_ants = end_ant - start_ant;
-
     AntSwarm::set_exploration_coef(cfg.eps);
-    AntSwarm ants(my_nb_ants);
-    std::size_t my_seed = current_seed + rank;
-    ants.initialiser_positions_aleatoires(land, my_seed);
+    AntSwarm ants(partition.nb_ants);
+    initialiser_partition_fourmis(land, cfg, partition, ants);
 
     pheronome phen(land.dimensions(), pos_food, pos_nest, cfg.alpha, cfg.beta);
 
     std::unique_ptr<Window> win;
     std::unique_ptr<Renderer> renderer;
-    if (activer_gui) {
+    if (gui_local) {
         win = std::make_unique<Window>(
-            "Simulation ACO",
+            "Simulation ACO MPI",
             static_cast<int>(2 * land.dimensions() + 10),
             static_cast<int>(land.dimensions() + 266)
         );
         renderer = std::make_unique<Renderer>(land, phen, pos_nest, pos_food, ants);
     }
 
-    MesuresRepetition mesures;
+    MesuresLocales mesures;
     std::size_t food_quantity = 0;
     std::size_t it = 0;
     bool cont_loop = true;
     bool premiere_nourriture_detectee = false;
 
-    const auto debut_total = horloge::now();
+    const std::size_t phen_count = phen.stride() * phen.stride() * 2ULL;
+    if (phen_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::overflow_error("Carte de pheromones trop grande pour MPI_Allreduce.");
+    }
+
+    const auto t_total_start = MPI_Wtime();
     while (cont_loop && it < cfg.max_iters) {
         ++it;
 
-        if (activer_gui) {
+        if (gui_local) {
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
                 if (event.type == SDL_QUIT) {
@@ -457,51 +575,48 @@ MesuresRepetition executer_repetition(const Config& cfg,
             }
         }
 
-        const auto debut_move = horloge::now();
-
         std::size_t batch_food = 0;
-
+        auto t0 = MPI_Wtime();
         ants.advance_one(phen, land, pos_food, pos_nest, batch_food);
-       
+        auto t1 = MPI_Wtime();
+        mesures.t_compute_move_ms += (t1 - t0) * 1000.0;
+
         unsigned long local_food = static_cast<unsigned long>(batch_food);
-        unsigned long global_food = 0;
-       
+        unsigned long global_food = 0UL;
+        t0 = MPI_Wtime();
         MPI_Allreduce(&local_food, &global_food, 1, MPI_UNSIGNED_LONG, MPI_SUM, MPI_COMM_WORLD);
+        t1 = MPI_Wtime();
+        mesures.t_comm_food_ms += (t1 - t0) * 1000.0;
+        food_quantity += static_cast<std::size_t>(global_food);
 
-        food_quantity += global_food;
+        t0 = MPI_Wtime();
+        phen.do_evaporation();
+        t1 = MPI_Wtime();
+        mesures.t_compute_evap_ms += (t1 - t0) * 1000.0;
 
-        const auto fin_move = horloge::now();
-
-        mesures.t_move_ants_ms += std::chrono::duration<double, std::milli>(fin_move - debut_move).count();
-
-        const auto debut_evap = horloge::now();
-        if (rank == 0) {
-            phen.do_evaporation();
-        }
-        const auto fin_evap = horloge::now();
-        mesures.t_evap_ms += std::chrono::duration<double, std::milli>(fin_evap - debut_evap).count();
-
-        const auto debut_update = horloge::now();
+        t0 = MPI_Wtime();
         phen.update();
+        t1 = MPI_Wtime();
+        mesures.t_compute_update_ms += (t1 - t0) * 1000.0;
 
-        MPI_Allreduce(MPI_IN_PLACE,
-              phen.data(),
-              phen.stride() * phen.stride() * 2,
-              MPI_DOUBLE,
-              MPI_MAX,
-              MPI_COMM_WORLD);
+        t0 = MPI_Wtime();
+        MPI_Allreduce(
+            MPI_IN_PLACE,
+            phen.data(),
+            static_cast<int>(phen_count),
+            MPI_DOUBLE,
+            MPI_MAX,
+            MPI_COMM_WORLD
+        );
+        t1 = MPI_Wtime();
+        mesures.t_comm_pher_ms += (t1 - t0) * 1000.0;
 
-        const auto fin_update = horloge::now();
-        mesures.t_pher_update_ms +=
-            std::chrono::duration<double, std::milli>(fin_update - debut_update).count();
-       
-        if (activer_gui) {
-            const auto debut_render = horloge::now();
+        if (gui_local) {
+            t0 = MPI_Wtime();
             renderer->display(*win, food_quantity);
             win->blit();
-            const auto fin_render = horloge::now();
-            mesures.t_render_ms +=
-                std::chrono::duration<double, std::milli>(fin_render - debut_render).count();
+            t1 = MPI_Wtime();
+            mesures.t_render_ms += (t1 - t0) * 1000.0;
         }
 
         if (!premiere_nourriture_detectee && food_quantity > 0) {
@@ -509,37 +624,34 @@ MesuresRepetition executer_repetition(const Config& cfg,
             premiere_nourriture_detectee = true;
         }
     }
-    const auto fin_total = horloge::now();
+    const auto t_total_end = MPI_Wtime();
 
-    mesures.t_total_ms = std::chrono::duration<double, std::milli>(fin_total - debut_total).count();
     mesures.food_kpi = food_quantity;
-    mesures.iterations_executees = it;
-    mesures.checksum = calculer_checksum(phen, ants);
+    mesures.t_compute_ms =
+        mesures.t_compute_move_ms + mesures.t_compute_evap_ms +
+        mesures.t_compute_update_ms + mesures.t_render_ms;
+    mesures.t_comm_ms = mesures.t_comm_food_ms + mesures.t_comm_pher_ms;
+    mesures.t_total_ms = (t_total_end - t_total_start) * 1000.0;
+    mesures.ecart_sanity_ms = std::abs(mesures.t_total_ms - (mesures.t_compute_ms + mesures.t_comm_ms));
+
+    if (calculer_checksum) {
+        mesures.checksum_global = calculer_checksum_global(
+            phen,
+            ants,
+            cfg.nb_ants,
+            rank,
+            counts,
+            displs
+        );
+    }
 
     return mesures;
 }
 
-void afficher_sanity_check(const MesuresRepetition& mesures, bool mode_gui) {
-    const double somme_etapes =
-        mesures.t_move_ants_ms + mesures.t_evap_ms + mesures.t_pher_update_ms + mesures.t_render_ms;
-    const double ecart = std::abs(mesures.t_total_ms - somme_etapes);
-    const double tolerance = std::max(1.0, 0.05 * mesures.t_total_ms);
-    const bool check_total = ecart <= tolerance;
-
-    std::cout << "Sanity Check: T_total ~= T_move_ants + T_evap + T_pher_update + T_render"
-              << " | ecart=" << std::fixed << std::setprecision(6) << ecart << " ms"
-              << " | statut=" << (check_total ? "OK" : "A_VERIFIER") << "\n";
-
-    if (!mode_gui) {
-        const bool check_render = std::abs(mesures.t_render_ms) <= 1e-9;
-        std::cout << "Sanity Check (--gui 0): T_render ~ 0"
-                  << " | valeur=" << std::fixed << std::setprecision(6) << mesures.t_render_ms << " ms"
-                  << " | statut=" << (check_render ? "OK" : "A_VERIFIER") << "\n";
-    }
-}
-
 int main(int argc, char* argv[]) {
-    int rank, size;
+    int rank = 0;
+    int size = 1;
+
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
@@ -547,86 +659,160 @@ int main(int argc, char* argv[]) {
     try {
         Config cfg = parse_args(argc, argv);
         const ParametresFractal params_fractal = construire_parametres_fractal(cfg.grid_size);
-       
+        const auto partition = construire_partition(cfg.nb_ants, rank, size);
+        const auto counts = construire_counts(cfg.nb_ants, size);
+        const auto displs = construire_displacements(counts);
+
+        if (size != 1 && cfg.gui && rank == 0) {
+            std::cout << "GUI desactivee: mode MPI multi-processus.\n";
+        }
+        if (size != 1) {
+            cfg.gui = false;
+        }
         if (rank != 0) {
             cfg.gui = false;
         }
 
         if (rank == 0) {
             if (params_fractal.taille_effective != cfg.grid_size) {
-            std::cerr << "Avertissement: la taille de grille demandee " << cfg.grid_size
-                      << " est ajustee a " << params_fractal.taille_effective << ".\n";
+                std::cerr << "Avertissement: la taille de grille demandee " << cfg.grid_size
+                          << " est ajustee a " << params_fractal.taille_effective << ".\n";
             }
-            std::cout << "--- Q4 OpenMP memoire partagee (timings par etape, SoA) ---\n";
+
+            std::cout << "--- Q4 MPI pur (environnement replique) ---\n";
             std::cout << "Grille: " << params_fractal.taille_effective
-                    << " | Fourmis: " << cfg.nb_ants
-                    << " | Iterations max: " << cfg.max_iters
-                    << " | Repetitions: " << cfg.repetitions
-                    << " | GUI: " << (cfg.gui ? "ON" : "OFF")
-                    << " | Threads OpenMP: " << omp_get_max_threads()
-                    << " | Coeurs logiques detectes: " << omp_get_num_procs() << "\n";
-
-            std::cout << "Exécution du Warm-up pour chauffer le cache...\n";
+                      << " | Fourmis: " << cfg.nb_ants
+                      << " | Iterations max: " << cfg.max_iters
+                      << " | Repetitions: " << cfg.repetitions
+                      << " | GUI: " << (cfg.gui ? "ON" : "OFF")
+                      << " | MPI np: " << size << "\n";
+            std::cout << "Warm-up en cours...\n";
         }
-    
-        (void)executer_repetition(cfg, params_fractal, false, rank, size);
- 
-        bool sdl_initialisee = false;
 
+        (void)executer_repetition(
+            cfg,
+            params_fractal,
+            false,
+            rank,
+            size,
+            partition,
+            counts,
+            displs,
+            false
+        );
+
+        bool sdl_initialisee = false;
         if (cfg.gui && rank == 0) {
             if (SDL_Init(SDL_INIT_VIDEO) != 0) {
                 throw std::runtime_error("Impossible d'initialiser SDL en mode GUI.");
             }
             sdl_initialisee = true;
         }
-        MPI_Barrier(MPI_COMM_WORLD);
-        
-        std::vector<double> t_move_ants;
-        std::vector<double> t_evap;
-        std::vector<double> t_pher_update;
-        std::vector<double> t_render;
-        std::vector<double> t_total;
+
         std::vector<std::size_t> premiere_iteration_nourriture;
         std::vector<std::size_t> food_kpi;
         std::vector<std::uint64_t> checksums;
+        std::vector<double> t_compute_move;
+        std::vector<double> t_compute_evap;
+        std::vector<double> t_compute_update;
+        std::vector<double> t_compute;
+        std::vector<double> t_comm_food;
+        std::vector<double> t_comm_pher;
+        std::vector<double> t_comm;
+        std::vector<double> t_total;
+        std::vector<double> t_sanity_ecart;
 
-        t_move_ants.reserve(static_cast<std::size_t>(cfg.repetitions));
-        t_evap.reserve(static_cast<std::size_t>(cfg.repetitions));
-        t_pher_update.reserve(static_cast<std::size_t>(cfg.repetitions));
-        t_render.reserve(static_cast<std::size_t>(cfg.repetitions));
-        t_total.reserve(static_cast<std::size_t>(cfg.repetitions));
-        premiere_iteration_nourriture.reserve(static_cast<std::size_t>(cfg.repetitions));
-        food_kpi.reserve(static_cast<std::size_t>(cfg.repetitions));
-        checksums.reserve(static_cast<std::size_t>(cfg.repetitions));
+        if (rank == 0) {
+            const auto rep_count = static_cast<std::size_t>(cfg.repetitions);
+            premiere_iteration_nourriture.reserve(rep_count);
+            food_kpi.reserve(rep_count);
+            checksums.reserve(rep_count);
+            t_compute_move.reserve(rep_count);
+            t_compute_evap.reserve(rep_count);
+            t_compute_update.reserve(rep_count);
+            t_compute.reserve(rep_count);
+            t_comm_food.reserve(rep_count);
+            t_comm_pher.reserve(rep_count);
+            t_comm.reserve(rep_count);
+            t_total.reserve(rep_count);
+            t_sanity_ecart.reserve(rep_count);
+        }
 
         for (int rep = 0; rep < cfg.repetitions; ++rep) {
-            const MesuresRepetition mesures = executer_repetition(cfg, params_fractal, cfg.gui, rank, size);
+            MesuresLocales local = executer_repetition(
+                cfg,
+                params_fractal,
+                cfg.gui,
+                rank,
+                size,
+                partition,
+                counts,
+                displs,
+                true
+            );
 
-            unsigned long long global_sum_checksum = 0;
-            MPI_Reduce(&mesures.checksum, &global_sum_checksum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+            double g_compute_move = 0.0;
+            double g_compute_evap = 0.0;
+            double g_compute_update = 0.0;
+            double g_compute = 0.0;
+            double g_comm_food = 0.0;
+            double g_comm_pher = 0.0;
+            double g_comm = 0.0;
+            double g_total = 0.0;
+            double g_ecart_sanity = 0.0;
+
+            MPI_Reduce(&local.t_compute_move_ms, &g_compute_move, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local.t_compute_evap_ms, &g_compute_evap, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local.t_compute_update_ms, &g_compute_update, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local.t_compute_ms, &g_compute, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local.t_comm_food_ms, &g_comm_food, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local.t_comm_pher_ms, &g_comm_pher, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local.t_comm_ms, &g_comm, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local.t_total_ms, &g_total, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local.ecart_sanity_ms, &g_ecart_sanity, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+            unsigned long long food_local = static_cast<unsigned long long>(local.food_kpi);
+            unsigned long long food_global = 0ULL;
+            MPI_Reduce(&food_local, &food_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
+            unsigned long long first_it_local =
+                static_cast<unsigned long long>(local.premiere_iteration_nourriture);
+            unsigned long long first_it_global = 0ULL;
+            MPI_Reduce(
+                &first_it_local,
+                &first_it_global,
+                1,
+                MPI_UNSIGNED_LONG_LONG,
+                MPI_MAX,
+                0,
+                MPI_COMM_WORLD
+            );
 
             if (rank == 0) {
-                t_move_ants.push_back(mesures.t_move_ants_ms);
-                t_evap.push_back(mesures.t_evap_ms);
-                t_pher_update.push_back(mesures.t_pher_update_ms);
-                t_render.push_back(mesures.t_render_ms);
-                t_total.push_back(mesures.t_total_ms);
-                premiere_iteration_nourriture.push_back(mesures.premiere_iteration_nourriture);
-                food_kpi.push_back(mesures.food_kpi);
-                checksums.push_back(global_sum_checksum);
+                premiere_iteration_nourriture.push_back(static_cast<std::size_t>(first_it_global));
+                food_kpi.push_back(static_cast<std::size_t>(food_global));
+                checksums.push_back(local.checksum_global);
+                t_compute_move.push_back(g_compute_move);
+                t_compute_evap.push_back(g_compute_evap);
+                t_compute_update.push_back(g_compute_update);
+                t_compute.push_back(g_compute);
+                t_comm_food.push_back(g_comm_food);
+                t_comm_pher.push_back(g_comm_pher);
+                t_comm.push_back(g_comm);
+                t_total.push_back(g_total);
+                t_sanity_ecart.push_back(g_ecart_sanity);
+
+                const double tolerance = std::max(1.0, 0.05 * g_total);
+                const bool sanity_ok = g_ecart_sanity <= tolerance;
 
                 std::cout << "Rep " << (rep + 1) << "/" << cfg.repetitions
-                        << " | T_move_ants=" << std::fixed << std::setprecision(6) << mesures.t_move_ants_ms << " ms"
-                        << " | T_evap=" << mesures.t_evap_ms << " ms"
-                        << " | T_pher_update=" << mesures.t_pher_update_ms << " ms"
-                        << " | T_render=" << mesures.t_render_ms << " ms"
-                        << " | T_total=" << mesures.t_total_ms << " ms"
-                        << " | First_Iteration=" << mesures.premiere_iteration_nourriture
-                        << " | Food_KPI=" << mesures.food_kpi
-                        << " | Global_Checksum=" << global_sum_checksum
-                        << "\n";
-
-                afficher_sanity_check(mesures, cfg.gui);
+                          << " | T_compute=" << std::fixed << std::setprecision(6) << g_compute << " ms"
+                          << " | T_comm=" << g_comm << " ms"
+                          << " | T_total=" << g_total << " ms"
+                          << " | Food_KPI=" << food_global
+                          << " | Checksum=" << local.checksum_global
+                          << " | Sanity=" << (sanity_ok ? "OK" : "A_VERIFIER")
+                          << " (ecart_max_ranks=" << g_ecart_sanity << " ms)\n";
             }
         }
 
@@ -638,60 +824,84 @@ int main(int argc, char* argv[]) {
             std::filesystem::create_directories("results");
             std::ofstream csv_file("results/Q4_timings_breakdown.csv");
             if (!csv_file.is_open()) {
-                std::cerr << "Erreur: impossible d'ecrire results/Q4_timings_breakdown.csv\n";
-                return 1;
+                throw std::runtime_error("Impossible d'ecrire results/Q4_timings_breakdown.csv");
             }
 
-            csv_file << "Repetition,First_Iteration,Food_KPI,Checksum,T_move_ants,T_evap,T_pher_update,T_render,T_total\n";
+            csv_file << "Repetition,MPI_Procs,First_Iteration,Food_KPI,Checksum,"
+                        "T_compute_move_ms,T_compute_evap_ms,T_compute_update_ms,T_compute_ms,"
+                        "T_comm_food_ms,T_comm_pher_ms,T_comm_ms,T_total_ms,Sanity_ecart_ms\n";
+
             for (std::size_t i = 0; i < t_total.size(); ++i) {
                 csv_file << (i + 1) << ","
-                        << std::fixed << std::setprecision(6) << premiere_iteration_nourriture[i] << ","
-                        << food_kpi[i] << ","
-                        << checksums[i] << ","
-                        << t_move_ants[i] << ","
-                        << t_evap[i] << ","
-                        << t_pher_update[i] << ","
-                        << t_render[i] << ","
-                        << t_total[i] << "\n";
+                         << size << ","
+                         << premiere_iteration_nourriture[i] << ","
+                         << food_kpi[i] << ","
+                         << checksums[i] << ","
+                         << std::fixed << std::setprecision(6)
+                         << t_compute_move[i] << ","
+                         << t_compute_evap[i] << ","
+                         << t_compute_update[i] << ","
+                         << t_compute[i] << ","
+                         << t_comm_food[i] << ","
+                         << t_comm_pher[i] << ","
+                         << t_comm[i] << ","
+                         << t_total[i] << ","
+                         << t_sanity_ecart[i] << "\n";
             }
 
-            const double mean_move = calculer_moyenne(t_move_ants);
-            const double mean_evap = calculer_moyenne(t_evap);
-            const double mean_update = calculer_moyenne(t_pher_update);
-            const double mean_render = calculer_moyenne(t_render);
+            const double mean_compute_move = calculer_moyenne(t_compute_move);
+            const double mean_compute_evap = calculer_moyenne(t_compute_evap);
+            const double mean_compute_update = calculer_moyenne(t_compute_update);
+            const double mean_compute = calculer_moyenne(t_compute);
+            const double mean_comm_food = calculer_moyenne(t_comm_food);
+            const double mean_comm_pher = calculer_moyenne(t_comm_pher);
+            const double mean_comm = calculer_moyenne(t_comm);
             const double mean_total = calculer_moyenne(t_total);
+            const double mean_sanity = calculer_moyenne(t_sanity_ecart);
 
-            const double std_move = calculer_ecart_type(t_move_ants, mean_move);
-            const double std_evap = calculer_ecart_type(t_evap, mean_evap);
-            const double std_update = calculer_ecart_type(t_pher_update, mean_update);
-            const double std_render = calculer_ecart_type(t_render, mean_render);
+            const double std_compute_move = calculer_ecart_type(t_compute_move, mean_compute_move);
+            const double std_compute_evap = calculer_ecart_type(t_compute_evap, mean_compute_evap);
+            const double std_compute_update = calculer_ecart_type(t_compute_update, mean_compute_update);
+            const double std_compute = calculer_ecart_type(t_compute, mean_compute);
+            const double std_comm_food = calculer_ecart_type(t_comm_food, mean_comm_food);
+            const double std_comm_pher = calculer_ecart_type(t_comm_pher, mean_comm_pher);
+            const double std_comm = calculer_ecart_type(t_comm, mean_comm);
             const double std_total = calculer_ecart_type(t_total, mean_total);
+            const double std_sanity = calculer_ecart_type(t_sanity_ecart, mean_sanity);
 
             csv_file << "MEAN,"
-                    << std::fixed << std::setprecision(6) << ",,,"
-                    << mean_move << ","
-                    << mean_evap << ","
-                    << mean_update << ","
-                    << mean_render << ","
-                    << mean_total << "\n";
+                     << size << ",,,,"
+                     << std::fixed << std::setprecision(6)
+                     << mean_compute_move << ","
+                     << mean_compute_evap << ","
+                     << mean_compute_update << ","
+                     << mean_compute << ","
+                     << mean_comm_food << ","
+                     << mean_comm_pher << ","
+                     << mean_comm << ","
+                     << mean_total << ","
+                     << mean_sanity << "\n";
+
             csv_file << "STD_DEV,"
-                    << std::fixed << std::setprecision(6) << ",,,"
-                    << std_move << ","
-                    << std_evap << ","
-                    << std_update << ","
-                    << std_render << ","
-                    << std_total << "\n";
+                     << size << ",,,,"
+                     << std::fixed << std::setprecision(6)
+                     << std_compute_move << ","
+                     << std_compute_evap << ","
+                     << std_compute_update << ","
+                     << std_compute << ","
+                     << std_comm_food << ","
+                     << std_comm_pher << ","
+                     << std_comm << ","
+                     << std_total << ","
+                     << std_sanity << "\n";
 
-            std::cout << "\n=== Resultats Q4 (timings par etape) ===\n";
-            std::cout << "Moyennes (ms):"
-                    << " move_ants=" << mean_move
-                    << " | evap=" << mean_evap
-                    << " | pher_update=" << mean_update
-                    << " | render=" << mean_render
-                    << " | total=" << mean_total << "\n";
+            std::cout << "\n=== Resultats Q4 MPI ===\n";
+            std::cout << "Moyennes (ms): T_compute=" << mean_compute
+                      << " | T_comm=" << mean_comm
+                      << " | T_total=" << mean_total << "\n";
+            std::cout << "CSV genere: results/Q4_timings_breakdown.csv\n";
 
-            std::cout << "CSV local genere: results/Q4_timings_breakdown.csv\n";
-            afficher_verification_reproductibilite_openmp(food_kpi, checksums);
+            afficher_verification_baseline_q2(size, food_kpi, checksums);
         }
 
         MPI_Finalize();
@@ -701,7 +911,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "Erreur: " << e.what() << "\n";
             afficher_aide(argv[0]);
         }
-        MPI_Abort(MPI_COMM_WORLD, 1); // <--- Esto mata a todos los ranks si uno falla
+        MPI_Abort(MPI_COMM_WORLD, 1);
         return 1;
     }
 }

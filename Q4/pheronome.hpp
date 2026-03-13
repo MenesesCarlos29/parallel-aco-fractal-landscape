@@ -4,11 +4,9 @@
 #include <array>
 #include <cassert>
 #include <iostream>
-#include <omp.h>
 #include <utility>
 #include <vector>
 #include "basic_types.hpp"
-#include <mpi.h>
 
 /**
  * @brief Carte des phéronomes
@@ -72,8 +70,6 @@ public:
     pheronome_t* data() { return m_map_of_pheronome.data(); }
 
     void do_evaporation( ) {
-        m_buffer_pheronome = m_map_of_pheronome;
-        #pragma omp parallel for collapse(2) schedule(static)
         for ( std::size_t i = 1; i <= m_dim; ++i )
             for ( std::size_t j = 1; j <= m_dim; ++j ) {
                 m_buffer_pheronome[i * m_stride + j][0] *= m_beta;

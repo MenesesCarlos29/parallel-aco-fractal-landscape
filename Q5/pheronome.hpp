@@ -34,10 +34,24 @@ public:
         : m_dim(dim), m_stride(dim + 2), m_alpha(alpha), m_beta(beta),
           m_pos_nest(pos_nest), m_pos_food(pos_food)
     {
-        size_t rows_per_proc = dim / (size_t)size;
-        size_t remainder = dim % (size_t)size;
-        m_row_start = (size_t)rank * rows_per_proc + std::min((size_t)rank, remainder);
-        m_local_height = rows_per_proc + ((size_t)rank < remainder ? 1 : 0);
+        if (size <= 0) {
+            throw std::runtime_error("MPI size invalide (<=0) dans pheronome");
+        }
+        if (dim == 0) {
+            throw std::runtime_error("dimensions invalides (0) dans pheronome");
+        }
+        if (static_cast<unsigned long>(size) > dim) {
+            throw std::runtime_error("Desprocesos MPI > dimension de la grille en pheronome");
+        }
+
+        size_t rows_per_proc = dim / static_cast<size_t>(size);
+        size_t remainder = dim % static_cast<size_t>(size);
+        m_row_start = static_cast<size_t>(rank) * rows_per_proc + std::min(static_cast<size_t>(rank), remainder);
+        m_local_height = rows_per_proc + (static_cast<size_t>(rank) < remainder ? 1 : 0);
+
+        if (m_local_height == 0) {
+            throw std::runtime_error("local_height == 0 dans pheronome");
+        }
 
         m_map_of_pheronome.assign(m_stride * (m_local_height + 2), {{0., 0.}});
 
@@ -61,14 +75,39 @@ public:
     ~pheronome( )                 = default;
 
     pheronome_t& operator( )( size_t i_global, size_t j_global ) {
-        size_t j_local = j_global - m_row_start + 1; 
+        long long j_global_ll = static_cast<long long>(j_global);
+        long long row_start_ll = static_cast<long long>(m_row_start);
+        long long row_end_ll = static_cast<long long>(m_row_start + m_local_height - 1);
+        if (j_global_ll < row_start_ll - 1 || j_global_ll > row_end_ll + 1) {
+            throw std::out_of_range("pheronome::operator() j_global hors plage locale + halo");
+        }
+        if (i_global + 1 >= m_stride) {
+            throw std::out_of_range("pheronome::operator() i_global hors plage");
+        }
+        size_t j_local = static_cast<size_t>(j_global - m_row_start + 1);
         return m_map_of_pheronome[j_local * m_stride + (i_global + 1)];
     }
 
     const pheronome_t& operator( )( size_t i_global, size_t j_global ) const {
-        size_t j_local = j_global - m_row_start + 1; 
+        long long j_global_ll = static_cast<long long>(j_global);
+        long long row_start_ll = static_cast<long long>(m_row_start);
+        long long row_end_ll = static_cast<long long>(m_row_start + m_local_height - 1);
+        if (j_global_ll < row_start_ll - 1 || j_global_ll > row_end_ll + 1) {
+            throw std::out_of_range("pheronome::operator() j_global hors plage locale + halo");
+        }
+        if (i_global + 1 >= m_stride) {
+            throw std::out_of_range("pheronome::operator() i_global hors plage");
+        }
+        size_t j_local = static_cast<size_t>(j_global - m_row_start + 1);
         return m_map_of_pheronome[j_local * m_stride + (i_global + 1)];
     }
+
+    std::size_t dimensions() const { return m_dim; }
+    std::size_t stride() const { return m_stride; }
+    std::size_t local_height() const { return m_local_height; }
+    std::size_t row_start() const { return m_row_start; }
+    double* data() { return reinterpret_cast<double*>(m_map_of_pheronome.data()); }
+    const double* data() const { return reinterpret_cast<const double*>(m_map_of_pheronome.data()); }
 
     bool is_local(size_t j_global) const {
         return (j_global >= m_row_start && j_global < m_row_start + m_local_height);

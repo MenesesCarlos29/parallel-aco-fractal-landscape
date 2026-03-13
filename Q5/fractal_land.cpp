@@ -2,20 +2,35 @@
 # include "rand_generator.hpp"
 #include <vector>
 #include <algorithm>
+#include <stdexcept>
 
 fractal_land::fractal_land(const dim_t& ln2_dim, unsigned long nbSeeds, double deviation, int seed, int rank, int size) :
     m_dimensions(0)
 {
     // dim_ss_grid = 2^{ln2_dim}
-    unsigned long dim_ss_grid = 1UL<<(ln2_dim);
-    m_dimensions = nbSeeds*dim_ss_grid+1;
+    unsigned long dim_ss_grid = 1UL << (ln2_dim);
+    m_dimensions = nbSeeds * dim_ss_grid + 1;
 
-    unsigned long rows_per_proc = m_dimensions / size;
-    unsigned long remainder = m_dimensions % size;
+    if (size <= 0) {
+        throw std::runtime_error("MPI size invalide (<=0) dans fractal_land");
+    }
+    if (m_dimensions == 0) {
+        throw std::runtime_error("dimensions invalides (0) dans fractal_land");
+    }
+    if (static_cast<unsigned long>(size) > m_dimensions) {
+        throw std::runtime_error("Desprocesos MPI > dimension de la grille dans fractal_land");
+    }
 
-    m_row_start = rank * rows_per_proc + std::min((unsigned long)rank, remainder);
-    unsigned long row_end = m_row_start + rows_per_proc + ((unsigned long)rank < remainder ? 1 : 0);
+    unsigned long rows_per_proc = m_dimensions / static_cast<unsigned long>(size);
+    unsigned long remainder = m_dimensions % static_cast<unsigned long>(size);
+
+    m_row_start = static_cast<unsigned long>(rank) * rows_per_proc + std::min(static_cast<unsigned long>(rank), remainder);
+    unsigned long row_end = m_row_start + rows_per_proc + (static_cast<unsigned long>(rank) < remainder ? 1 : 0);
     m_local_height = row_end - m_row_start;
+
+    if (m_local_height == 0) {
+        throw std::runtime_error("local_height == 0 dans fractal_land");
+    }
 
     std::vector<double> temp_global_altitude(m_dimensions * m_dimensions, 0.0);
 

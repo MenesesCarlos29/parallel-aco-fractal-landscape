@@ -71,7 +71,7 @@ summarize_results:
 	@base_total=$$(awk -F, 'FNR==2 {print $$15}' "$(RESULTS_DIR)/Q5_scaling_np1.csv"); \
 	out="$(RESULTS_DIR)/Q5_scaling_summary.csv"; \
 	printf "P,T_compute_ms,T_comm_ms,T_total_ms,Speedup_vs_np1,Efficiency_vs_np1,Comm_pct,Ants_Min,Ants_Avg,Ants_Max,Imbalance\n" > "$$out"; \
-	for f in $$(ls $(RESULTS_DIR)/Q5_scaling_np*.csv 2>/dev/null | sort -V); do \
+	for f in $$(ls $(RESULTS_DIR)/Q5_scaling_np*.csv 2>/dev/null | msort -V); do \
 		awk -F, -v base="$$base_total" 'FNR==2 {p=$$2; tc=$$10; tm=$$14; tt=$$15; sp=base/tt; eff=sp/p; cp=100*tm/tt; amin=$$16; aavg=$$17; amax=$$18; imb=$$20; printf "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.2f,%.2f,%.2f,%.2f,%.6f\n", p, tc, tm, tt, sp, eff, cp, amin, aavg, amax, imb }' "$$f" >> "$$out"; \
 	done; \
 	echo "Summary generated: $$out"; \

@@ -19,6 +19,10 @@
 \usepackage[strict]{changepage}
 \usepackage{framed}
 \usepackage{hyperref}
+\usepackage{amsmath}   
+\usepackage{amssymb}  
+\usepackage{subcaption}
+\usepackage{etoolbox}
 
 % ----------------------------------------------------
 % PARAMETRES DE MISE EN PAGE
@@ -712,5 +716,341 @@ Les conclusions principales sont les suivantes :
 \end{itemize}
 
 En synthese, la Q3 valide un gain mesurable par parallelisation en memoire partagee, avec une acceleration maximale d'environ \(1.235\times\) par rapport a Q2. Le resultat reste loin du speedup ideal, mais il est scientifiquement coherent avec la loi d'Amdahl, avec l'irregularite du noyau de deplacement, et avec les limites materielles de la plateforme.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Q4 : Paralelización por Distribución de Hormigas (MPI)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Q4 : Parallélisation par distribution des fourmis (MPI)}
+
+\subsection{Stratégie de parallélisation : Environnement global et agents distribués}
+
+La Q4 adopte une stratégie de parallélisation par duplication complète de l’environnement. Contrairement à la future Q5, chaque processus MPI possède en mémoire l'intégralité du \texttt{fractal\_land} et de la carte de \texttt{pheronome}. La parallélisation repose exclusivement sur la distribution de la population de fourmis.
+
+\paragraph{Distribution des agents et équilibrage: }
+Le nombre total de fourmis $M$ est réparti équitablement entre les $P$ processus ($M/P$ fourmis par rang). Cette approche garantit un \textbf{équilibrage de charge (load balancing) parfait}, car chaque cœur traite le même nombre d'agents indépendamment de leur position sur la carte.
+
+\paragraph{Implications techniques: }
+Chaque processus manipule son propre lot de fourmis via la structure SoA héritée de la Q2. Les attributs suivants sont locaux à chaque rang MPI :
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{m\_x} et \texttt{m\_y} (positions) ;
+  \item \texttt{m\_is\_loaded} et \texttt{m\_seed} (états et graines aléatoires).
+\end{itemize}
+
+L'initialisation utilise le \texttt{rank} MPI pour différencier les graines pseudo-aléatoires, évitant ainsi que les processus ne simulent des trajectoires identiques.
+
+\paragraph{Contraintes: }
+Le principal inconvénient est la redondance mémoire : la grille complète doit être répliquée sur chaque nœud. De plus, bien que le calcul soit distribué, la cohérence globale de la carte de phéromones nécessitera des communications collectives coûteuses lors de la phase de synchronisation.
+
+
+\subsection{Gestion de la communication et cohérence des phéromones}
+
+La distribution des agents sur des processus distincts introduit un problème de cohérence : chaque rang MPI génère des dépôts de phéromones sur sa copie locale. Sans synchronisation, les cartes divergent, compromettant la logique collective de l'essaim.
+
+La solution repose sur une réduction collective pour fusionner les contributions locales. L'opération choisie est \texttt{MPI\_MAX} car la règle métier impose de retenir la trace la plus forte lorsqu'une cellule est marquée par plusieurs agents. Ce choix simule un passage arbitraire des fourmis en privilégiant l'intensité maximale.
+
+Le mécanisme de synchronisation utilise la primitive suivante :
+
+\begin{verbatim}
+// Fusion des cartes locales vers une version cohérente globale
+MPI_Allreduce(local_phen.data(), global_phen.data(),
+              size_grid, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+\end{verbatim}
+
+
+L'analyse des performances montre que cette étape constitue le principal goulet d'étranglement de la Q4. Contrairement au déplacement des agents, qui est parfaitement parallèle, la réduction impose l'échange de l'intégralité de la grille ($N^2$) à chaque pas de temps. Ce coût de communication devient rapidement dominant face au temps de calcul pur lorsque le nombre de processus augmente ou que la résolution de la grille s'accroît.
+
+Enfin, l'évaporation est effectuée localement par chaque processus après la réduction. Cette séquence garantit que tous les rangs débutent l'itération suivante avec une vision strictement identique de l'environnement, préservant la reproductibilité de la simulation.
+
+
+
+\subsection{Analyse de l'équilibrage des tâches et passage à l'échelle}
+
+L'approche par distribution des agents offre un équilibrage de charge statique. Contrairement à la version OpenMP (Q3), qui nécessitait un ordonnancement dynamique pour compenser l'irrégularité des déplacements, la Q4 répartit équitablement les agents dès le lancement. Chaque processus MPI reçoit exactement $M/P$ fourmis, garantissant une charge de calcul identique sur chaque rang.
+
+Cette stratégie élimine toute contention mémoire. En adoptant un modèle de type \emph{shared-nothing}, chaque processus travaille dans son propre espace d'adressage sans partage de structures critiques. Les verrous \texttt{critical} et \texttt{atomic} disparaissent au profit d'une exécution locale sans collision sur les accès mémoire.
+
+Le passage à l'échelle (scalability) dépendra du rapport entre le temps de calcul des agents (parallèle) et le temps de communication des phéromones (séquentiel). L'efficacité sera évaluée via le Speedup $S(p) = T_s / T_p$ et l'Efficacité $E(p) = S(p)/p$, où $T_s$ est le temps de référence et $T_p$ le temps sur $p$ processus.
+
+Points clés de l'approche :
+\begin{itemize}[leftmargin=1.2em]
+  \item équilibrage parfait par construction sans surcoût d'ordonnancement ;
+  \item suppression de la contention sur les ressources partagées ;
+  \item dépendance critique au coût de la réduction globale \texttt{MPI\_Allreduce}.
+\end{itemize}
+
+
+
+\subsection{Impact du volume de données échangées sur les performances}
+
+La synchronisation des phéromones via \texttt{MPI\_Allreduce} impose un échange de la totalité de la grille entre tous les processus à chaque itération. Contrairement au calcul du déplacement des fourmis, ce volume de communication est structurellement indépendant du nombre d'agents et dépend uniquement de la résolution spatiale du paysage.
+
+Pour une grille de taille $N \times N$ (ex : $513 \times 513$), chaque cellule est un \texttt{double} occupant 8 octets. Le volume de données transféré par itération est :
+\[
+V_{\text{iter}} = N^2 \times 8 = 513^2 \times 8 \approx 2.1 \text{ Mo}
+\]
+
+Sur une simulation de 2000 itérations, le volume cumulé atteint environ 4.1 Go. Ce transfert massif représente le coût fixe de la synchronisation globale. La performance de la Q4 dépend alors du ratio entre le temps de calcul et le temps de communication :
+\[
+\text{Ratio} = \frac{T_{\text{calc}}}{T_{\text{comm}}} \propto \frac{M/P}{N^2}
+\]
+
+Où $M$ est le nombre de fourmis et $P$ le nombre de processus. L'approche demeure rentable tant que $M \gg N^2$, c'est-à-dire quand le travail algorithmique par agent compense le coût réseau. Si la grille est grande mais que la population d'agents est faible, le temps de communication devient dominant et dégrade l'efficacité.
+
+Cette limitation souligne le coût de la duplication complète de l'environnement. Elle constitue la motivation principale du passage à la décomposition de domaine en Q5, qui vise à réduire ces échanges en partitionnant la grille plutôt qu'en la répliquant.
+\subsection{Resultats et analyse quantitative}
+
+Le temps sequentiel de reference est extrait de \texttt{final\_results/Q2\_timings\_breakdown.csv} :
+\[
+T_s = 6026.461186\ \text{ms}
+\]
+
+Le speedup et l'efficacite sont evalues selon les formules suivantes :
+\[
+S(p) = \frac{T_s}{T_p} \qquad\qquad E(p) = \frac{S(p)}{p}
+\]
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Synthese des performances Q4 a partir de \texttt{final\_results/Q4\_scaling\_summary.csv}.}
+  \label{tab:q4-scaling}
+  \begin{tabular}{@{}rrrr@{}}
+    \toprule
+    Processus \(p\) & Temps moyen \(T_p\) (ms) & Speedup \(S(p)\) & Efficacite \(E(p)\) \\
+    \midrule
+    1 & 5551.946 & 1.086 & 1.086 \\
+    2 & 11197.313 & 0.538 & 0.269 \\
+    4 & 29837.727 & 0.202 & 0.050 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+L'analyse de la Q4 montre que la version MPI reste competitive a 1 processus avec un speedup de 1.086. Cette legere amelioration par rapport a Q2 s'explique par la restructuration du code et l'absence de certains mecanismes de gestion de threads propres a OpenMP. Cependant, les performances se degradent severement lors de la montee en charge.
+
+Le passage a 2 processus entraine un doublement du temps d'execution ($T_2 = 11197.313$ ms), faisant chuter le speedup a 0.538. A 4 processus, le temps s'effondre a 29837.727 ms. Cette degradation est la consequence directe du cout de synchronisation via \texttt{MPI\_Allreduce}. Les donnees de profilage indiquent que la communication absorbe la majorite du temps CPU, confirmant que le ratio calcul/communication est defavorable pour cette resolution de grille.
+
+Contrairement a la Q3 qui profitait d'un partage memoire, la Q4 subit ici le poids des echanges reseau explicites. Le gain apporte par la distribution des agents est totalement annule par la necessite de maintenir une carte de pheromones globale coherente sur chaque rang.
+
+
+
+\subsection{Analyse des figures de scalabilité}
+
+Les graphiques ci-dessous illustrent l'évolution du temps d'exécution, du speedup et de l'efficacité en fonction du nombre de processus MPI pour la stratégie Q4.
+
+\begin{figure}[H]
+  \centering
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{../final_results/q4_time_vs_processes.png}
+    \caption*{Temps d'exécution en fonction du nombre de processus.}
+  \end{minipage}
+  \hfill
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{../final_results/q4_speedup.png}
+    \caption*{Speedup mesuré comparé au speedup idéal.}
+  \end{minipage}
+
+  \vspace{0.8em}
+
+  \begin{minipage}{0.58\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{../final_results/q4_efficiency.png}
+    \caption*{Efficacité de parallélisation.}
+  \end{minipage}
+  \caption{Graphiques de scalabilité Q4 générés à partir des résultats réels.}
+  \label{fig:q4-graphs}
+\end{figure}
+
+L'analyse des courbes met en évidence une pathologie caractéristique d'un grain de communication trop élevé. Entre 1 et 4 processus, la courbe de temps présente une pente positive abrupte, passant de $5551$ ms à $29837$ ms. Cela signale que le surcoût réseau croît exponentiellement par rapport au bénéfice du calcul distribué.
+
+L'efficacité s'effondre à $0.050$ pour 4 processus, signifiant que 95\% du temps d'exécution est consommé par la coordination des données via \texttt{MPI\_Allreduce}. Ce comportement valide l'hypothèse d'un goulot d'étranglement lié à la réplication complète de l'environnement : le volume de données échangé ($O(N^2)$) sature la bande passante. Cette signature de performance justifie scientifiquement le passage à la stratégie de la Q5, basée sur une décomposition de domaine.
+
+\subsection{Conclusion Q4}
+
+La Q4 démontre qu'un équilibrage de charge parfait au niveau du calcul ne garantit pas une scalabilité positive en milieu distribué si le coût de communication est prépondérant. Les conclusions principales de cette étape sont les suivantes :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item {Scalabilité négative} : La stratégie de duplication complète génère un speedup largement inférieur à 1 ($S=0.20$ à $p=4$), rendant l'exécution parallèle beaucoup plus lente que l'exécution séquentielle.
+  \item {Saturation réseau} : Le goulet d'étranglement est la réduction collective, dont le coût écrase le gain de calcul. À 4 processus, la communication représente plus de 73\% du temps total.
+  \item {Indépendance du volume} : Le volume de données synchronisé ($O(N^2)$) est indépendant du nombre d'agents, ce qui paralyse la simulation pour des résolutions de grille standard ($512 \times 512$).
+  \item {Transition nécessaire} : Ces résultats imposent de repenser la structure de données pour passer d'une communication globale vers une communication locale de type "halos" aux interfaces, objet de la question suivante.
+\end{itemize}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Q5 : Paralelización por Descomposición de Dominio (MPI)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Q5 : Parallélisation par décomposition de domaine (MPI)}
+
+\subsection{Stratégie de partitionnement de la carte et gestion des agents locaux}
+La Q5 abandonne le modèle de duplication complète au profit d'une décomposition unidimensionnelle du domaine spatial. Le paysage fractal global de taille $N \times N$ est divisé horizontalement en $P$ bandes de lignes, où chaque processus MPI est responsable d'une tranche $[row\_start, row\_end[$. Cette répartition linéaire s'appuie sur le \texttt{rank} pour définir la portion locale du terrain.
+Chaque processus maintient trois catégories de lignes en mémoire : ses données locales ainsi que deux lignes supplémentaires nommées halos ou \emph{ghost cells} (une au-dessus et une au-dessous). Ces halos stockent temporairement les valeurs de phéromones des rangs voisins afin que les agents situés aux frontières puissent consulter l'environnement adjacent sans nécessiter de reconstruction globale. La mémoire par processus est ainsi réduite à environ $O(N^2 / P)$, levant la contrainte de réplication intégrale qui paralysait la Q4.
+Les communications de la Q5 se structurent autour de deux mécanismes distincts :
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{L'échange des halos} : après chaque mise à jour locale, chaque processus utilise \texttt{MPI\_Sendrecv} pour synchroniser ses frontières avec ses voisins directs. Le volume d'échange se limite à $2 \times N$ cellules par itération, soit une réduction drastique par rapport à la réduction globale de la Q4.
+  \item \textbf{La migration des fourmis} : lorsqu'un agent franchit une frontière de domaine, son état complet (position, état de chargement, graine aléatoire) est sérialisé et transféré au processus voisin. L'usage de \texttt{MPI\_Sendrecv} avec des tags sémantiques assure l'intégrité du transfert et la conservation du nombre total de fourmis.
+\end{itemize}
+
+Contrairement à la Q4, l'équilibrage de charge n'est plus garanti par construction. Les fourmis se concentrent naturellement autour du nid et des sources de nourriture, créant une distribution spatiale non uniforme. Certains processus peuvent accumuler une majorité des agents tandis que d'autres demeurent inactifs. La Q5 échange ainsi la garantie d'une charge identique contre une maîtrise stricte du volume de communication, privilégiant le passage à l'échelle sur le réseau au détriment d'un équilibrage de calcul parfait.
+
+
+\subsection{Problématique de l'équilibre de charge (Load Balancing)}
+Le modèle ACO impose une concentration spatiale des agents qui convergent vers le nid, les sources de nourriture et les pistes de phéromones. Cette distribution non uniforme dépend de la topologie du paysage fractal.
+Le partitionnement unidimensionnel par bandes horizontales amplifie ce phénomène. Si un point d'intérêt majeur se situe dans la bande d'un seul processus, celui-ci devient le \emph{chemin critique} de la simulation. Il traite alors la quasi-totalité des calculs (déplacements, mises à jour) tandis que les autres rangs attendent derrière les barrières de synchronisation locales ou globales (\texttt{Food\_KPI}).
+
+La Q5 accepte ce déséquilibre comme le prix de la réduction drastique des communications. Le passage d'un volume d'échange de $O(N^2)$ (Q4) à $O(N)$ (Q5) justifie cette perte de symétrie : un processus surchargé en calcul mais libéré de la latence réseau massive s'avère souvent plus performant qu'une distribution parfaitement équilibrée mais saturée par le trafic.
+Pour quantifier ce phénomène, la campagne Q5 enregistre des métriques empiriques : le nombre minimum, moyen et maximum de fourmis par rang. Ces indicateurs permettent d'identifier les itérations où la concentration spatiale dégrade l'efficacité, offrant une clé de lecture essentielle pour interpréter les résultats de scalabilité.
+
+
+\subsection{Optimisation de l'empreinte mémoire et réduction des communications}
+
+La décomposition unidimensionnelle du domaine entraine une réduction drastique de l'empreinte mémoire par processus. Contrairement à la Q4, où chaque rang MPI répliquait la totalité de la grille, la Q5 alloue uniquement sa portion locale enrichie de deux lignes supplémentaires de halos.
+
+\subsubsection{Calcul de l'empreinte mémoire}
+
+Pour un domaine de taille globale $N \times N$ distribué sur $P$ processus, l'empreinte mémoire allouée par chaque rang se décompose comme suit :
+
+Chaque processus stocke :
+\begin{itemize}[leftmargin=1.2em]
+  \item sa bande locale : lignes $[row\_start, row\_end[$, soit $\lfloor N / P \rfloor$ à $\lceil N / P \rceil$ lignes ;
+  \item deux halos : une ligne au-dessus, une ligne au-dessous ;
+  \item la largeur complète : $N + 2$ colonnes pour conserver les frontières.
+\end{itemize}
+
+La structure de données pour les phéromones utilise un \texttt{std::array<double, 2>} par cellule (deux canaux). L'empreinte totale pour une instance est :
+
+\[
+M_{\text{processus}} = (m_{\text{local\_height}} + 2) \times (N + 2) \times 16\ \text{octets}
+\]
+
+où $m_{\text{local\_height}}$ est en moyenne $N / P + O(1)$. Le résultat simplifié en ordre de grandeur est :
+
+\[
+M_{\text{processus}} \approx \frac{N^2}{P} + O(N)
+\]
+
+En contraste, la Q4 alloue sur chaque processus l'intégralité de la grille :
+
+\[
+M_{\text{Q4}} \approx N^2
+\]
+
+Le gain en mémoire vive par processus est donc un facteur $P$ :
+
+\[
+\frac{M_{\text{Q4}}}{M_{\text{processus}}} \approx P
+\]
+
+Pour la plateforme de test avec $P = 4$ et $N = 513$, cela représente une réduction de 4 fois. Sur des grilles plus grandes ou des configurations avec davantage de processus, ce gain devient critique pour accéder à des simulations impossibles sous le régime de réplication complète.
+
+\subsubsection{Réduction du volume de communication}
+
+La synchronisation des phéromones en Q4 repose sur une réduction collective coûteuse. À chaque itération, l'opération \texttt{MPI\_Allreduce} échange la totalité de la grille entre tous les processus, soit un volume de :
+
+\[
+V_{\text{Q4}} = N^2 \times 8\ \text{octets} \approx 513^2 \times 8 \approx 2.1\ \text{Mo par itération}
+\]
+
+En Q5, la cohérence est maintenue via l'échange de halos uniquement aux frontières de domaine. Chaque synchronisation de halos transfère deux lignes complètes (une ascendante, une descendante) entre un rang et ses voisins directs. Le volume réel par itération est :
+
+\[
+V_{\text{Q5, halos}} = 2 \times 2 \times (N + 2) \times 8\ \text{octets} \approx 2 \times 2 \times 515 \times 8 \approx 16.4\ \text{kB par itération}
+\]
+
+Cette réduction massive, d'un facteur approximativement $N / 4 \approx 128$, transforme la nature du goulot d'étranglement : au lieu de synchroniser l'intégralité de la grille, seules les cellules situées aux interfaces sont communiquées. Pour une simulation de 2000 itérations, l'économie en volume transmis est spectaculaire :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item Q4 : $2.1\ \text{Mo} \times 2000 \approx 4.1\ \text{Go cumulé}$ ;
+  \item Q5 (halos seuls) : $16.4\ \text{kB} \times 2000 \approx 32.8\ \text{Mo cumulé}$.
+\end{itemize}
+
+S'ajoute à cela la migration des fourmis, dont le volume dépend de la distribution spatiale des agents. Dans le cas où les fourmis restent localisées à leur domaine de départ, la migration est quasi-nulle. Dans le cas contraire, le volume de migration s'ajoute aux halos, mais reste négligeable au regard de la réduction des halos eux-mêmes.
+
+\subsubsection{Implications pour la scalabilité}
+
+Le rapport calcul-communication devient :
+
+\[
+\text{Ratio}_{\text{Q5}} = \frac{T_{\text{calc}}}{T_{\text{comm}}} \propto \frac{M / P}{N}
+\]
+
+où $M$ est le nombre total de fourmis et $N$ la résolution spatiale. Comparé au ratio de la Q4 :
+
+\[
+\text{Ratio}_{\text{Q4}} = \frac{T_{\text{calc}}}{T_{\text{comm}}} \propto \frac{M / P}{N^2}
+\]
+
+L'amélioration expose un écart linéaire en $N$, ce qui signifie que pour une grille volumineuse, le rapport calcul-communication en Q5 devient favorable bien avant celui de la Q4.
+
+Cette transformation du bilan énergétique communication-calcul est la clé scientifique permettant à la décomposition de domaine de surmonter le handicap du déséquilibre de charge vis-à-vis de la réplication distribuée.
+
+
+
+\subsection{Synthèse comparative des performances (Q3, Q4 et Q5)}
+
+Le tableau suivant récapitule les performances obtenues pour les différentes stratégies de parallélisation. La comparaison s'appuie sur le temps de référence séquentiel $T_s = 6026.46$ ms (Q2).
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Récapitulatif global des performances sur un seul nœud.}
+  \label{tab:comparaison-finale}
+  \begin{tabular}{@{}rrrrr@{}}
+    \toprule
+    Stratégie & Processus/Threads \(p\) & Temps moyen \(T_p\) (ms) & Speedup \(S(p)\) & Efficacité \(E(p)\) \\
+    \midrule
+    Q3 (OpenMP) & 4 & 4878.286 & 1.235 & 0.309 \\
+    \midrule
+    Q4 (MPI Globale) & 1 & 5551.946 & 1.085 & 1.085 \\
+    Q4 (MPI Globale) & 4 & 29837.727 & 0.202 & 0.050 \\
+    \midrule
+    Q5 (MPI Domaine) & 1 & 9888.921 & 0.609 & 0.609 \\
+    Q5 (MPI Domaine) & 2 & 7012.872 & 0.859 & 0.430 \\
+    Q5 (MPI Domaine) & 4 & 5637.943 & 1.069 & 0.267 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \begin{minipage}{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{../final_results/q5_time.png}
+        \caption{Évolution du temps total (Q5).}
+    \end{minipage}
+    \hfill
+    \begin{minipage}{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{../final_results/q5_speedup.png}
+        \caption{Speedup mesuré (Q5).}
+    \end{minipage}
+\end{figure}
+
+L'analyse comparative des données révèle des comportements opposés selon la gestion de la localité :
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{L'échec de la réplication globale (Q4)} : La Q4 présente une scalabilité négative frappante. Avec 4 processus, le temps est multiplié par 5,4. Ce phénomène est dû à l'explosion du volume de communication (\texttt{MPI\_Allreduce}), qui sature la bande passante et rend la parallélisation totalement contre-productive.
+  \item \textbf{La viabilité de la décomposition de domaine (Q5)} : Contrairement à la Q4, la Q5 parvient à réduire le temps d'exécution à mesure que l'on ajoute des ressources. L'échange de halos en $O(N)$ permet de maintenir un coût de communication raisonnable malgré la complexité de gestion des agents.
+  \item \textbf{Impact du Load Balancing} : Comme illustré par la figure ci-dessous, l'efficacité décroît à mesure que le déséquilibre de charge augmente (\texttt{Imbalance} = 1.47 à $p=4$). La concentration des fourmis crée un chemin critique qui explique pourquoi la Q5 reste légèrement en deçà de la Q3 (OpenMP).
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\linewidth]{../final_results/q5_imbalance.png}
+    \caption{Corrélation entre le déséquilibre de charge et l'efficacité (Q5).}
+\end{figure}
+
+
+\subsection{Conclusion Générale}
+
+Ce projet a permis d'explorer les défis de la parallélisation d'une simulation complexe à base d'agents (ACO). Les expérimentations mènent aux conclusions suivantes :
+
+D'une part, la parallélisation en mémoire partagée (Q3) s'avère la plus efficace pour une exécution sur un seul nœud. Elle tire profit d'une communication à coût quasi nul, bien que limitée par la loi d'Amdahl et les contentions mémoire lors de l'accès aux phéromones.
+
+D'autre part, le passage au modèle distribué (MPI) souligne l'importance cruciale de l'algorithmique. La stratégie naïve de réplication complète (Q4) échoue face au coût réseau, tandis que la décomposition de domaine (Q5) s'impose comme la seule solution viable pour le passage à l'échelle. Bien qu'elle introduise un déséquilibre de charge, la Q5 minimise drastiquement les flux de données.
+
+En synthèse, la réussite d'un calcul massivement parallèle sur ce type de simulation repose sur un compromis constant entre granularité de calcul et volume de communication. La décomposition de domaine, en transformant un problème global en échanges locaux, constitue la base indispensable pour des simulations de plus grande envergure.
 
 \end{document}
